@@ -538,7 +538,7 @@ impl DirEntryEditor {
     }
 
     async fn write<IO: ReadWriteSeek, TP, OCC>(&self, fs: &FileSystem<IO, TP, OCC>) -> Result<(), IO::Error> {
-        let mut disk = fs.disk.borrow_mut();
+        let mut disk = fs.disk.as_ref().unwrap().borrow_mut();
         disk.seek(io::SeekFrom::Start(self.pos)).await?;
         self.data.serialize(&mut *disk).await
     }

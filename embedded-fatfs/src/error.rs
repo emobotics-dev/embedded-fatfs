@@ -32,6 +32,8 @@ pub enum Error<T> {
     UnsupportedFileNameCharacter,
     /// An entry in the file table is corrupted/invalid.
     CorruptedFileEntry,
+    /// The storage disk was unmounted and is not accessible anymore.
+    DiskNotMounted,
 }
 
 impl<T: Debug + core::fmt::Display> IoError for Error<T> {
@@ -40,6 +42,18 @@ impl<T: Debug + core::fmt::Display> IoError for Error<T> {
     }
 }
 
+impl<T: IoError> From<&Error<T>> for Error<T> {
+    fn from(error: &Error<T>) -> Self {
+        match error {
+            Error::DiskNotMounted => Error::DiskNotMounted,
+            _ => panic!(),
+        }
+    }
+}
+
+// Upstream's bounds (`+ Debug + Display`), kept over ours on the rebase — the
+// `From<&Error<T>>` impl above is the part this commit adds and is unaffected
+// by them.
 impl<T: IoError + Debug + core::fmt::Display> From<T> for Error<T> {
     fn from(error: T) -> Self {
         Error::Io(error)
@@ -79,6 +93,7 @@ impl<T: core::fmt::Display> core::fmt::Display for Error<T> {
             Error::AlreadyExists => write!(f, "File or directory already exists"),
             Error::CorruptedFileSystem => write!(f, "Corrupted file system"),
             Error::CorruptedFileEntry => write!(f, "Corrupted file entry"),
+            Error::DiskNotMounted => write!(f, "Disk not mounted"),
         }
     }
 }

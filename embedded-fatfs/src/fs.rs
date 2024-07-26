@@ -322,7 +322,7 @@ impl FileSystemStats {
 ///
 /// `FileSystem` struct is representing a state of a mounted FAT volume.
 pub struct FileSystem<IO: Read + Write + Seek, TP, OCC> {
-    pub(crate) disk: RefCell<IO>,
+    pub(crate) disk: Option<RefCell<IO>>,
     pub(crate) options: FsOptions<TP, OCC>,
     fat_type: FatType,
     bpb: BiosParameterBlock,
@@ -413,7 +413,7 @@ impl<IO: ReadWriteSeek, TP, OCC> FileSystem<IO, TP, OCC> {
         let status_flags = bpb.status_flags();
         trace!("FileSystem::new end");
         Ok(Self {
-            disk: RefCell::new(disk),
+            disk: Some(RefCell::new(disk)),
             options,
             fat_type,
             bpb,
@@ -510,7 +510,7 @@ impl<IO: ReadWriteSeek, TP, OCC> FileSystem<IO, TP, OCC> {
             alloc_cluster(&mut fat, self.fat_type, prev_cluster, hint, self.total_clusters).await?
         };
         if zero {
-            let mut disk = self.disk.borrow_mut();
+            let mut disk = self.disk.as_ref().ok_or(Error::DiskNotMounted)?.borrow_mut();
             disk.seek(SeekFrom::Start(self.offset_from_cluster(cluster))).await?;
             write_zeros(&mut *disk, u64::from(self.cluster_size())).await?;
         }
@@ -571,8 +571,9 @@ impl<IO: ReadWriteSeek, TP, OCC> FileSystem<IO, TP, OCC> {
     /// # Errors
     ///
     /// `Error::Io` will be returned if the underlying storage object returned an I/O error.
-    pub async fn unmount(self) -> Result<(), Error<IO::Error>> {
-        self.flush().await
+    pub async fn unmount(mut self) -> Result<IO, Error<IO::Error>> {
+        self.flush().await?;
+        Ok(self.disk.take().ok_or(Error::DiskNotMounted)?.into_inner())
     }
 
     /// Flushes any in memory state to the filesystem
@@ -588,7 +589,7 @@ impl<IO: ReadWriteSeek, TP, OCC> FileSystem<IO, TP, OCC> {
     async fn flush_fs_info(&self) -> Result<(), Error<IO::Error>> {
         let mut fs_info = self.fs_info.borrow_mut();
         if self.fat_type == FatType::Fat32 && fs_info.dirty {
-            let mut disk = self.disk.borrow_mut();
+            let mut disk = self.disk.as_ref().ok_or(Error::DiskNotMounted)?.borrow_mut();
             let fs_info_sector_offset = self.offset_from_sector(u32::from(self.bpb.fs_info_sector));
             disk.seek(SeekFrom::Start(fs_info_sector_offset)).await?;
             fs_info.serialize(&mut *disk).await?;
@@ -615,7 +616,7 @@ impl<IO: ReadWriteSeek, TP, OCC> FileSystem<IO, TP, OCC> {
         } else {
             0x025
         };
-        let mut disk = self.disk.borrow_mut();
+        let mut disk = self.disk.as_ref().unwrap().borrow_mut();
         disk.seek(io::SeekFrom::Start(offset)).await?;
         disk.write_u8(encoded).await?;
         disk.flush().await?;
@@ -719,13 +720,13 @@ impl<IO: ReadWriteSeek, TP, OCC> IoBase for FsIoAdapter<'_, IO, TP, OCC> {
 
 impl<IO: ReadWriteSeek, TP, OCC> Read for FsIoAdapter<'_, IO, TP, OCC> {
     async fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
-        self.fs.disk.borrow_mut().read(buf).await
+        Ok(self.fs.disk.as_ref().unwrap().borrow_mut().read(buf).await?)
     }
 }
 
 impl<IO: ReadWriteSeek, TP, OCC> Write for FsIoAdapter<'_, IO, TP, OCC> {
     async fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
-        let size = self.fs.disk.borrow_mut().write(buf).await?;
+        let size = self.fs.disk.as_ref().unwrap().borrow_mut().write(buf).await?;
         if size > 0 {
             self.fs.set_dirty_flag(true).await?;
         }
@@ -733,13 +734,13 @@ impl<IO: ReadWriteSeek, TP, OCC> Write for FsIoAdapter<'_, IO, TP, OCC> {
     }
 
     async fn flush(&mut self) -> Result<(), Self::Error> {
-        self.fs.disk.borrow_mut().flush().await
+        Ok(self.fs.disk.as_ref().unwrap().borrow_mut().flush().await?)
     }
 }
 
 impl<IO: ReadWriteSeek, TP, OCC> Seek for FsIoAdapter<'_, IO, TP, OCC> {
     async fn seek(&mut self, pos: SeekFrom) -> Result<u64, Self::Error> {
-        self.fs.disk.borrow_mut().seek(pos).await
+        Ok(self.fs.disk.as_ref().unwrap().borrow_mut().seek(pos).await?)
     }
 }
 

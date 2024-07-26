@@ -241,7 +241,7 @@ impl<'a, IO: ReadWriteSeek, TP, OCC> File<'a, IO, TP, OCC> {
 
     async fn flush(&mut self) -> Result<(), Error<IO::Error>> {
         self.flush_dir_entry().await?;
-        let mut disk = self.fs.disk.borrow_mut();
+        let mut disk = self.fs.disk.as_ref().ok_or(Error::DiskNotMounted)?.borrow_mut();
         disk.flush().await?;
         Ok(())
     }
@@ -336,7 +336,7 @@ impl<IO: ReadWriteSeek, TP: TimeProvider, OCC> Read for File<'_, IO, TP, OCC> {
         trace!("read {} bytes in cluster {}", read_size, current_cluster);
         let offset_in_fs = self.fs.offset_from_cluster(current_cluster) + u64::from(offset_in_cluster);
         let read_bytes = {
-            let mut disk = self.fs.disk.borrow_mut();
+            let mut disk = self.fs.disk.as_ref().ok_or(Error::DiskNotMounted)?.borrow_mut();
             disk.seek(SeekFrom::Start(offset_in_fs)).await?;
             disk.read(&mut buf[..read_size]).await?
         };
@@ -412,7 +412,7 @@ impl<IO: ReadWriteSeek, TP: TimeProvider, OCC> Write for File<'_, IO, TP, OCC> {
         trace!("write {} bytes in cluster {}", write_size, current_cluster);
         let offset_in_fs = self.fs.offset_from_cluster(current_cluster) + u64::from(offset_in_cluster);
         let written_bytes = {
-            let mut disk = self.fs.disk.borrow_mut();
+            let mut disk = self.fs.disk.as_ref().ok_or(Error::DiskNotMounted)?.borrow_mut();
             disk.seek(SeekFrom::Start(offset_in_fs)).await?;
             disk.write(&buf[..write_size]).await?
         };
