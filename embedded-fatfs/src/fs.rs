@@ -403,6 +403,7 @@ impl<IO: ReadWriteSeek, TP, OCC> FileSystem<IO, TP, OCC> {
 
         // if dirty flag is set completly ignore free_cluster_count in FSInfo
         if bpb.status_flags().dirty {
+            warn!("fs was not properly unmounted");
             fs_info.free_cluster_count = None;
         }
 
