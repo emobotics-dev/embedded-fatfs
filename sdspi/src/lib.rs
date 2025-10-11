@@ -77,7 +77,9 @@ where
 {
     // Supply minimum of 74 clock cycles without CS asserted.
     cs.set_high().map_err(|_| Error::ChipSelect)?;
-    spi.write(&[0xFF; 10]).await.map_err(|_| Error::SpiError)?;
+    // Try flushing the card as done here: https://github.com/greiman/SdFat/blob/master/src/SdCard/SdSpiCard.cpp#L170,
+    // https://github.com/rust-embedded-community/embedded-sdmmc-rs/pull/65#issuecomment-1270709448
+    spi.write(&[0xFF; 256]).await.map_err(|_| Error::SpiError)?;
 
     Ok(())
 }
