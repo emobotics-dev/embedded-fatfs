@@ -707,7 +707,7 @@ impl<IO: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter> FileSystem<IO, TP
 /// `Drop` implementation tries to unmount the filesystem when dropping.
 impl<IO: Read + Write + Seek, TP, OCC> Drop for FileSystem<IO, TP, OCC> {
     fn drop(&mut self) {
-        if self.current_status_flags.get().dirty {
+        if self.disk.is_some() && self.current_status_flags.get().dirty {
             warn!("Dropping FileSytem without unmount");
         }
     }
