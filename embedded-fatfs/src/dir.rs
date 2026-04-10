@@ -404,20 +404,50 @@ impl<'a, IO: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter> Dir<'a, IO, T
         match r {
             // directory does not exist - create it
             DirEntryOrShortName::ShortName(short_name) => {
-                // alloc cluster for directory data
+                // Allocate + zero-fill a cluster for the new directory's
+                // content.
                 let cluster = self.fs.alloc_cluster(None, true).await?;
-                // create entry in parent directory
-                let sfn_entry = e.create_sfn_entry(short_name, FileAttributes::DIRECTORY, Some(cluster));
+
+                // Populate the new cluster with "." and ".." BEFORE
+                // committing the parent directory entry that points at
+                // it. If any of the writes below fails, we leak the
+                // allocated cluster (benign) but leave no dangling
+                // parent-side pointer — correct FAT write ordering is
+                // child content → parent pointer.
+                //
+                // The temporary `Dir` we build here wraps a `File` with
+                // `entry: None` because the parent DirEntry does not
+                // exist yet. It is used only for the `.`/`..` writes;
+                // the returned `Dir` is reconstructed via
+                // `entry.to_dir()` once the parent entry has been
+                // committed, so subsequent operations on the new
+                // directory pick up the correct DirEntryEditor.
+                {
+                    let tmp_file = File::new(Some(cluster), None, self.fs);
+                    let tmp_dir: Dir<'a, IO, TP, OCC> =
+                        Dir::new(DirRawStream::File(tmp_file), self.fs);
+
+                    let dot_sfn = ShortNameGenerator::generate_dot();
+                    let dot_entry =
+                        e.create_sfn_entry(dot_sfn, FileAttributes::DIRECTORY, Some(cluster));
+                    tmp_dir.write_entry(".", dot_entry).await?;
+
+                    let dotdot_sfn = ShortNameGenerator::generate_dotdot();
+                    let dotdot_entry = e.create_sfn_entry(
+                        dotdot_sfn,
+                        FileAttributes::DIRECTORY,
+                        e.stream.first_cluster(),
+                    );
+                    tmp_dir.write_entry("..", dotdot_entry).await?;
+                }
+
+                // Now commit the parent directory entry. If this write
+                // fails, the pre-populated cluster becomes orphaned
+                // (leaked, not corrupt).
+                let sfn_entry =
+                    e.create_sfn_entry(short_name, FileAttributes::DIRECTORY, Some(cluster));
                 let entry = e.write_entry(name, sfn_entry).await?;
-                let dir = entry.to_dir();
-                // create special entries "." and ".."
-                let dot_sfn = ShortNameGenerator::generate_dot();
-                let sfn_entry = e.create_sfn_entry(dot_sfn, FileAttributes::DIRECTORY, entry.first_cluster());
-                dir.write_entry(".", sfn_entry).await?;
-                let dotdot_sfn = ShortNameGenerator::generate_dotdot();
-                let sfn_entry = e.create_sfn_entry(dotdot_sfn, FileAttributes::DIRECTORY, e.stream.first_cluster());
-                dir.write_entry("..", sfn_entry).await?;
-                Ok(dir)
+                Ok(entry.to_dir())
             }
             // directory already exists - return it
             DirEntryOrShortName::DirEntry(e) => Ok(e.to_dir()),
