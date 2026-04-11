@@ -952,7 +952,16 @@ where
     IO: ReadWriteSeek,
     F: FnMut(u64, u64),
 {
-    const ZEROS: [u8; 512] = [0_u8; 512];
+    // 8 KiB chunk = 16 × 512-byte blocks. When the caller is a
+    // `BufStream<_, 512>` sitting on a real `BlockDevice`, passing an
+    // 8 KiB buffer lets BufStream take its aligned-multiple-of-SIZE
+    // fast path and hand the whole slice to `BlockDevice::write` in
+    // one call. SD-backed implementations (e.g. `sdspi`) then use the
+    // CMD25 multi-block write with pre-erase (ACMD23), which is an
+    // order of magnitude faster than the per-sector CMD24 loop you
+    // get from 512-byte chunks and greatly reduces the card's
+    // internal wear-leveling pressure during a full FAT zero-fill.
+    const ZEROS: [u8; 8192] = [0_u8; 8192];
     let total = len;
     let mut written: u64 = 0;
     while len > 0 {
