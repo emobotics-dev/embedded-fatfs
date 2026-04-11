@@ -50,10 +50,22 @@ impl<T: core::fmt::Debug> embedded_io_async::Error for BufStreamError<T> {
 /// handles the RMW (Read, Modify, Write) cycle for you.
 pub struct BufStream<T: BlockDevice<SIZE>, const SIZE: usize> {
     inner: T,
+    // Primary cache slot. `read`/`write` always operate on this slot.
     buffer: Aligned<T::Align, [u8; SIZE]>,
     current_block: u32,
-    current_offset: u64,
     dirty: bool,
+    // Shadow cache slot. Holds the "other" recently-touched block so
+    // a 2-block ping-pong access pattern (notably mirrored FAT writes
+    // through `DiskSlice::write` in embedded-fatfs) can swap between
+    // the two cached blocks without going to disk. Without this slot,
+    // `format_fat` reproducibly melted the SD card's wear-leveling
+    // because every tiny FAT-entry write forced a full read-modify-
+    // write cycle for both FAT mirrors, hitting the same two sectors
+    // hundreds of times in a few seconds.
+    shadow_buffer: Aligned<T::Align, [u8; SIZE]>,
+    shadow_block: u32,
+    shadow_dirty: bool,
+    current_offset: u64,
 }
 
 impl<T: BlockDevice<SIZE>, const SIZE: usize> BufStream<T, SIZE> {
@@ -66,6 +78,9 @@ impl<T: BlockDevice<SIZE>, const SIZE: usize> BufStream<T, SIZE> {
             current_offset: 0,
             buffer: Aligned([0; SIZE]),
             dirty: false,
+            shadow_buffer: Aligned([0; SIZE]),
+            shadow_block: u32::MAX,
+            shadow_dirty: false,
         }
     }
 
@@ -86,8 +101,15 @@ impl<T: BlockDevice<SIZE>, const SIZE: usize> BufStream<T, SIZE> {
             .expect("Block larger than 2TB")
     }
 
+    #[inline]
+    fn swap_slots(&mut self) {
+        core::mem::swap(&mut self.buffer, &mut self.shadow_buffer);
+        core::mem::swap(&mut self.current_block, &mut self.shadow_block);
+        core::mem::swap(&mut self.dirty, &mut self.shadow_dirty);
+    }
+
     async fn flush(&mut self) -> Result<(), T::Error> {
-        // flush the internal buffer if we have modified the buffer
+        // Flush both cache slots if they hold modified data.
         if self.dirty {
             self.dirty = false;
             // Note, alignment of internal buffer is guarenteed at compile time so we don't have to check it here
@@ -95,21 +117,49 @@ impl<T: BlockDevice<SIZE>, const SIZE: usize> BufStream<T, SIZE> {
                 .write(self.current_block, slice_to_blocks(&self.buffer[..]))
                 .await?;
         }
+        if self.shadow_dirty {
+            self.shadow_dirty = false;
+            self.inner
+                .write(self.shadow_block, slice_to_blocks(&self.shadow_buffer[..]))
+                .await?;
+        }
         Ok(())
     }
 
     async fn check_cache(&mut self) -> Result<(), T::Error> {
         let block_start = self.pointer_block_start();
-        if block_start != self.current_block {
-            // we may have modified data in old block, flush it to disk
-            self.flush().await?;
-            // We have seeked to a new block, read it
-            let buf = &mut self.buffer[..];
-            self.inner
-                .read(block_start, slice_to_blocks_mut(buf))
-                .await?;
-            self.current_block = block_start;
+        // Primary hit.
+        if block_start == self.current_block {
+            return Ok(());
         }
+        // Shadow hit: swap slots, no disk I/O needed. This is the
+        // case that rescues the FAT-mirror ping-pong pattern.
+        if self.shadow_block != u32::MAX && block_start == self.shadow_block {
+            self.swap_slots();
+            return Ok(());
+        }
+        // Full miss: both slots are "stale" w.r.t. the target. Evict
+        // the current shadow (flush if dirty), promote primary to
+        // shadow (preserving it for the next ping-pong step), and
+        // load the target block into primary.
+        if self.shadow_dirty {
+            self.shadow_dirty = false;
+            self.inner
+                .write(self.shadow_block, slice_to_blocks(&self.shadow_buffer[..]))
+                .await?;
+        }
+        // After the swap: primary holds what used to be shadow
+        // (stale, possibly all-zero after initial state) and shadow
+        // holds what used to be primary (the previously-active block
+        // which we want to preserve).
+        self.swap_slots();
+        // Load the target block into primary.
+        self.current_block = block_start;
+        self.dirty = false;
+        let buf = &mut self.buffer[..];
+        self.inner
+            .read(block_start, slice_to_blocks_mut(buf))
+            .await?;
         Ok(())
     }
 }
