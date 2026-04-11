@@ -935,12 +935,32 @@ impl OemCpConverter for LossyOemCpConverter {
     }
 }
 
-async fn write_zeros<IO: ReadWriteSeek>(disk: &mut IO, mut len: u64) -> Result<(), IO::Error> {
+async fn write_zeros<IO: ReadWriteSeek>(disk: &mut IO, len: u64) -> Result<(), IO::Error> {
+    write_zeros_progress(disk, len, |_, _| {}).await
+}
+
+/// Zero-fill `len` bytes at the current stream position, invoking
+/// `progress(bytes_written, total)` after each 512-byte chunk. Used by
+/// [`format_volume_with_progress`] to report the progress of the FAT
+/// zero-fill phase, which dominates format time for large volumes.
+async fn write_zeros_progress<IO, F>(
+    disk: &mut IO,
+    mut len: u64,
+    mut progress: F,
+) -> Result<(), IO::Error>
+where
+    IO: ReadWriteSeek,
+    F: FnMut(u64, u64),
+{
     const ZEROS: [u8; 512] = [0_u8; 512];
+    let total = len;
+    let mut written: u64 = 0;
     while len > 0 {
         let write_size = cmp::min(len, ZEROS.len() as u64) as usize;
         disk.write_all(&ZEROS[..write_size]).await?;
         len -= write_size as u64;
+        written += write_size as u64;
+        progress(written, total);
     }
     Ok(())
 }
@@ -1155,8 +1175,46 @@ pub async fn format_volume<S: ReadWriteSeek>(
     storage: &mut S,
     options: FormatVolumeOptions,
 ) -> Result<(), Error<S::Error>> {
+    format_volume_with_progress(storage, options, |_| {}).await
+}
+
+/// Formats the storage with the specified options, reporting coarse
+/// progress `0..=100` to `progress` during the FAT zero-fill phase.
+///
+/// The callback is invoked after every 512-byte chunk written during
+/// the FAT area zero-fill — typically many thousands of times per
+/// format. It is called synchronously (no `.await` between formatting
+/// work and the callback). The caller is responsible for any
+/// rate-limiting it needs: a trivial way is to remember the last
+/// reported percent and only act when the new percent is larger.
+///
+/// Progress mapping:
+/// * 0 on entry
+/// * scaled 0..=95 across the FAT zero-fill phase (the bulk of the
+///   time for any real-world volume)
+/// * 100 just before return
+///
+/// The small phases (BPB, FSInfo, format_fat, root-dir zero, label)
+/// are not individually reported — for any real card they are
+/// negligible compared to the FAT zero-fill.
+///
+/// # Errors
+///
+/// Same as [`format_volume`].
+#[allow(clippy::needless_pass_by_value)]
+pub async fn format_volume_with_progress<S, F>(
+    storage: &mut S,
+    options: FormatVolumeOptions,
+    mut progress: F,
+) -> Result<(), Error<S::Error>>
+where
+    S: ReadWriteSeek,
+    F: FnMut(u8),
+{
     trace!("format_volume");
     debug_assert!(storage.seek(SeekFrom::Current(0)).await? == 0);
+
+    progress(0);
 
     let bytes_per_sector = options.bytes_per_sector.unwrap_or(512);
     let total_sectors = if let Some(total_sectors) = options.total_sectors {
@@ -1172,18 +1230,21 @@ pub async fn format_volume<S: ReadWriteSeek>(
         total_sectors_64 as u32 // safe case: possible overflow is handled above
     };
 
+    trace!("fmt: boot_sector serialize");
     // Create boot sector, validate and write to storage device
     let (boot, fat_type) = format_boot_sector(&options, total_sectors, bytes_per_sector)?;
     if boot.validate::<S::Error>().is_err() {
         return Err(Error::InvalidInput);
     }
     boot.serialize(storage).await?;
+    trace!("fmt: boot_sector pad");
     // Make sure entire logical sector is updated (serialize method always writes 512 bytes)
     let bytes_per_sector = boot.bpb.bytes_per_sector;
     write_zeros_until_end_of_sector(storage, bytes_per_sector).await?;
 
     let bpb = &boot.bpb;
     if bpb.is_fat32() {
+        trace!("fmt: fs_info_sector seek");
         // FSInfo sector
         let fs_info_sector = FsInfoSector {
             free_cluster_count: None,
@@ -1193,23 +1254,43 @@ pub async fn format_volume<S: ReadWriteSeek>(
         storage
             .seek(SeekFrom::Start(bpb.bytes_from_sectors(bpb.fs_info_sector())))
             .await?;
+        trace!("fmt: fs_info_sector serialize");
         fs_info_sector.serialize(storage).await?;
+        trace!("fmt: fs_info_sector pad");
         write_zeros_until_end_of_sector(storage, bytes_per_sector).await?;
 
+        trace!("fmt: backup_boot_sector seek");
         // backup boot sector
         storage
             .seek(SeekFrom::Start(bpb.bytes_from_sectors(bpb.backup_boot_sector())))
             .await?;
+        trace!("fmt: backup_boot_sector serialize");
         boot.serialize(storage).await?;
+        trace!("fmt: backup_boot_sector pad");
         write_zeros_until_end_of_sector(storage, bytes_per_sector).await?;
     }
 
+    trace!("fmt: fat_area seek");
     // format File Allocation Table
     let reserved_sectors = bpb.reserved_sectors();
     let fat_pos = bpb.bytes_from_sectors(reserved_sectors);
     let sectors_per_all_fats = bpb.sectors_per_all_fats();
     storage.seek(SeekFrom::Start(fat_pos)).await?;
-    write_zeros(storage, bpb.bytes_from_sectors(sectors_per_all_fats)).await?;
+    trace!("fmt: fat_zero start, {} bytes", bpb.bytes_from_sectors(sectors_per_all_fats));
+    // Zero the FAT area with progress reporting — for real-world
+    // volumes this dominates format time, so mapping its byte counter
+    // to 0..=95 gives a useful progress indicator. See docs on
+    // `format_volume_with_progress`.
+    write_zeros_progress(
+        storage,
+        bpb.bytes_from_sectors(sectors_per_all_fats),
+        |done, total| {
+            let pct = if total == 0 { 95 } else { (done * 95 / total) as u8 };
+            progress(pct);
+        },
+    )
+    .await?;
+    trace!("fmt: fat_zero done, format_fat");
     {
         let mut fat_slice = fat_slice::<S, &mut S>(storage, bpb);
         let sectors_per_fat = bpb.sectors_per_fat();
@@ -1217,6 +1298,7 @@ pub async fn format_volume<S: ReadWriteSeek>(
         format_fat(&mut fat_slice, fat_type, bpb.media, bytes_per_fat, bpb.total_clusters()).await?;
     }
 
+    trace!("fmt: root_dir zero");
     // init root directory - zero root directory region for FAT12/16 and alloc first root directory cluster for FAT32
     let root_dir_first_sector = reserved_sectors + sectors_per_all_fats;
     let root_dir_sectors = bpb.root_dir_sectors();
@@ -1244,8 +1326,10 @@ pub async fn format_volume<S: ReadWriteSeek>(
         volume_entry.serialize(storage).await?;
     }
 
+    trace!("fmt: final_flush");
     storage.flush().await?;
     storage.seek(SeekFrom::Start(0)).await?;
+    progress(100);
     trace!("format_volume end");
     Ok(())
 }
