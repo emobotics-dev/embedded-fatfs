@@ -244,16 +244,36 @@ where
         block_address: u32,
         data: &[Aligned<ALIGN, [u8; SIZE]>],
     ) -> Result<(), Error> {
+        let n = data.len();
         let r = async {
-            if data.len() == 1 {
-                self.cmd(write_single_block(block_address)).await?;
-                self.write_data(DATA_START_BLOCK, &data[0][..]).await?;
-                self.wait_idle().await?;
+            if n == 1 {
+                self.cmd(write_single_block(block_address)).await.map_err(|e| {
+                    error!("sdspi::write[single] CMD24 @ {}: {:?}", block_address, e);
+                    e
+                })?;
+                self.write_data(DATA_START_BLOCK, &data[0][..]).await.map_err(|e| {
+                    error!("sdspi::write[single] write_data @ {}: {:?}", block_address, e);
+                    e
+                })?;
+                self.wait_idle().await.map_err(|e| {
+                    error!("sdspi::write[single] wait_idle @ {}: {:?}", block_address, e);
+                    e
+                })?;
                 // check status, in SD SPI mode, the status is two bytes
-                if self.cmd(sd_status()).await? != 0 {
+                let s1 = self.cmd(sd_status()).await.map_err(|e| {
+                    error!("sdspi::write[single] sd_status cmd @ {}: {:?}", block_address, e);
+                    e
+                })?;
+                if s1 != 0 {
+                    error!("sdspi::write[single] sd_status R1 nonzero @ {}: 0x{:02x}", block_address, s1);
                     return Err(Error::WriteError);
                 }
-                if self.read_byte().await? != 0 {
+                let s2 = self.read_byte().await.map_err(|e| {
+                    error!("sdspi::write[single] sd_status byte2 @ {}: {:?}", block_address, e);
+                    e
+                })?;
+                if s2 != 0 {
+                    error!("sdspi::write[single] sd_status byte2 nonzero @ {}: 0x{:02x}", block_address, s2);
                     return Err(Error::WriteError);
                 }
             } else {
@@ -261,20 +281,42 @@ where
                 // This will pre-erase blocks to improve write performance.
                 // We ignore the return value, because whether its accepted
                 // or not doesn't matter we will still proceed with the write
-                self.acmd(cmd::<R1>(0x17, data.len() as u32)).await?;
-                self.wait_idle().await?;
+                self.acmd(cmd::<R1>(0x17, n as u32)).await.map_err(|e| {
+                    error!("sdspi::write[multi] ACMD23 @ {} n={}: {:?}", block_address, n, e);
+                    e
+                })?;
+                self.wait_idle().await.map_err(|e| {
+                    error!("sdspi::write[multi] wait_idle post-ACMD23 @ {}: {:?}", block_address, e);
+                    e
+                })?;
 
-                self.cmd(write_multiple_blocks(block_address)).await?;
-                for block in data {
-                    self.wait_idle().await?;
-                    self.write_data(WRITE_MULTIPLE_TOKEN, &block[..]).await?;
+                let r1 = self.cmd(write_multiple_blocks(block_address)).await.map_err(|e| {
+                    error!("sdspi::write[multi] CMD25 @ {} n={}: {:?}", block_address, n, e);
+                    e
+                })?;
+                if r1 != 0 {
+                    error!("sdspi::write[multi] CMD25 R1 nonzero @ {} n={}: 0x{:02x}", block_address, n, r1);
+                    return Err(Error::RegisterError(r1));
+                }
+                for (i, block) in data.iter().enumerate() {
+                    self.wait_idle().await.map_err(|e| {
+                        error!("sdspi::write[multi] wait_idle pre-block {} @ {}: {:?}", i, block_address, e);
+                        e
+                    })?;
+                    self.write_data(WRITE_MULTIPLE_TOKEN, &block[..]).await.map_err(|e| {
+                        error!("sdspi::write[multi] write_data block {} @ {}: {:?}", i, block_address, e);
+                        e
+                    })?;
                 }
                 // stop the write
-                self.wait_idle().await?;
-                self.spi
-                    .write(&[STOP_TRAN_TOKEN])
-                    .await
-                    .map_err(|_| Error::SpiError)?;
+                self.wait_idle().await.map_err(|e| {
+                    error!("sdspi::write[multi] wait_idle pre-STOP @ {}: {:?}", block_address, e);
+                    e
+                })?;
+                self.spi.write(&[STOP_TRAN_TOKEN]).await.map_err(|_| {
+                    error!("sdspi::write[multi] STOP_TRAN spi error @ {}", block_address);
+                    Error::SpiError
+                })?;
             }
             Ok(())
         }
