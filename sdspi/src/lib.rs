@@ -333,17 +333,6 @@ where
                     error!("sdspi::write[multi] STOP_TRAN spi error @ {}", block_address);
                     Error::SpiError
                 })?;
-                // After STOP_TRAN the card may still need to finalise
-                // the multi-block write (wear-levelling, last-block
-                // commit). Without waiting here the next cmd()'s own
-                // wait_idle can catch a brief idle gap and then hit a
-                // re-busy during the data phase, observed as
-                // Error::RegisterError(0) on the first read after a
-                // long format_volume FAT zero-fill.
-                self.wait_idle().await.map_err(|e| {
-                    error!("sdspi::write[multi] wait_idle post-STOP @ {}: {:?}", block_address, e);
-                    e
-                })?;
             }
             Ok(())
         }
