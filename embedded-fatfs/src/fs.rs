@@ -1292,36 +1292,48 @@ where
         write_zeros_until_end_of_sector(storage, bytes_per_sector).await?;
     }
 
-    trace!("fmt: fat_area seek");
+    trace!("fmt: fat_area");
     // format File Allocation Table
     let reserved_sectors = bpb.reserved_sectors();
     let fat_pos = bpb.bytes_from_sectors(reserved_sectors);
-    let sectors_per_all_fats = bpb.sectors_per_all_fats();
-    storage.seek(SeekFrom::Start(fat_pos)).await?;
-    trace!("fmt: fat_zero start, {} bytes", bpb.bytes_from_sectors(sectors_per_all_fats));
-    // Zero the FAT area with progress reporting — for real-world
-    // volumes this dominates format time, so mapping its byte counter
-    // to 0..=95 gives a useful progress indicator. See docs on
-    // `format_volume_with_progress`.
-    write_zeros_progress(
-        storage,
-        bpb.bytes_from_sectors(sectors_per_all_fats),
-        |done, total| {
-            let pct = if total == 0 { 95 } else { (done * 95 / total) as u8 };
-            progress(pct);
-        },
-    )
-    .await?;
-    trace!("fmt: fat_zero done, format_fat");
-    {
-        let mut fat_slice = fat_slice::<S, &mut S>(storage, bpb);
-        let sectors_per_fat = bpb.sectors_per_fat();
-        let bytes_per_fat = bpb.bytes_from_sectors(sectors_per_fat);
-        format_fat(&mut fat_slice, fat_type, bpb.media, bytes_per_fat, bpb.total_clusters()).await?;
+    let sectors_per_fat = bpb.sectors_per_fat();
+    let bytes_per_fat = bpb.bytes_from_sectors(sectors_per_fat);
+    let fats = bpb.fats;
+    let total_clusters = bpb.total_clusters();
+
+    // Write each FAT copy sequentially by calling format_fat once
+    // per copy directly on `storage`, bypassing fat_slice's
+    // automatic mirroring. This keeps the card in a single
+    // continuous sequential write stream per FAT and avoids the
+    // mirror-write thrashing (alternating seeks between FAT1 and
+    // FAT2) that pushed BufStream's 1-slot cache into pathological
+    // evict-read-write cycles (~5 block ops per 512-byte chunk).
+    progress(0);
+    for fat_idx in 0..fats {
+        let fat_start = fat_pos + u64::from(fat_idx) * bytes_per_fat;
+        trace!("fmt: format_fat[{}] @ offset {} ({} bytes)", fat_idx, fat_start, bytes_per_fat);
+        storage.seek(SeekFrom::Start(fat_start)).await?;
+        format_fat(
+            storage,
+            fat_type,
+            bpb.media,
+            bytes_per_fat,
+            total_clusters,
+            |done, total| {
+                let base = u64::from(fat_idx) * bytes_per_fat;
+                let total_all = bytes_per_fat * u64::from(fats);
+                let pct = if total_all == 0 { 95 } else { ((base + done) * 95 / total_all) as u8 };
+                progress(pct);
+            },
+        )
+        .await?;
     }
+    progress(95);
+    trace!("fmt: format_fat done");
 
     trace!("fmt: root_dir zero");
     // init root directory - zero root directory region for FAT12/16 and alloc first root directory cluster for FAT32
+    let sectors_per_all_fats = bpb.sectors_per_all_fats();
     let root_dir_first_sector = reserved_sectors + sectors_per_all_fats;
     let root_dir_sectors = bpb.root_dir_sectors();
     let root_dir_pos = bpb.bytes_from_sectors(root_dir_first_sector);
