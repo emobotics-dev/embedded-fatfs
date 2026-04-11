@@ -1303,13 +1303,27 @@ where
     // through the fat_slice stream (which auto-mirrors to every FAT
     // copy). This avoids multi-block CMD25 bursts that proved
     // unreliable on the target SD card for sustained ~15 MB writes.
-    progress(5);
+    //
+    // Progress 0..=95 is mapped from format_fat's fat-fill byte
+    // counter — that step dominates wall time.
+    progress(0);
     info!("fmt: format_fat ({} bytes per FAT × {} mirrors)", bpb.bytes_from_sectors(bpb.sectors_per_fat()), bpb.fats);
     {
         let mut fat_slice = fat_slice::<S, &mut S>(storage, bpb);
         let sectors_per_fat = bpb.sectors_per_fat();
         let bytes_per_fat = bpb.bytes_from_sectors(sectors_per_fat);
-        format_fat(&mut fat_slice, fat_type, bpb.media, bytes_per_fat, bpb.total_clusters()).await?;
+        format_fat(
+            &mut fat_slice,
+            fat_type,
+            bpb.media,
+            bytes_per_fat,
+            bpb.total_clusters(),
+            |done, total| {
+                let pct = if total == 0 { 95 } else { (done * 95 / total) as u8 };
+                progress(pct);
+            },
+        )
+        .await?;
     }
     progress(95);
     info!("fmt: format_fat done");

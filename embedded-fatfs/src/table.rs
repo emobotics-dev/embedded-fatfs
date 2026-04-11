@@ -196,17 +196,19 @@ where
     }
 }
 
-pub(crate) async fn format_fat<S, E>(
+pub(crate) async fn format_fat<S, E, F>(
     fat: &mut S,
     fat_type: FatType,
     media: u8,
     bytes_per_fat: u64,
     total_clusters: u32,
+    mut progress: F,
 ) -> Result<(), Error<E>>
 where
     S: Read + Write + Seek,
     E: IoError,
     Error<E>: From<S::Error> + From<ReadExactError<S::Error>>,
+    F: FnMut(u64, u64),
 {
     const BITS_PER_BYTE: u64 = 8;
     // init first two reserved entries to FAT ID
@@ -244,12 +246,25 @@ where
         FatType::Fat16 => 4,
         FatType::Fat32 => 8,
     };
-    let mut to_write = bytes_per_fat.saturating_sub(reserved_bytes);
+    let zero_total = bytes_per_fat.saturating_sub(reserved_bytes);
+    let mut to_write = zero_total;
+    let mut last_log = 0_u64;
+    // Log every 64 KiB written so we can see progress on the UART
+    // even when the caller doesn't care about the `progress` callback.
+    const LOG_STEP: u64 = 64 * 1024;
+    progress(0, zero_total);
     while to_write > 0 {
         let chunk = cmp::min(to_write, ZEROS_CHUNK.len() as u64) as usize;
         fat.write_all(&ZEROS_CHUNK[..chunk]).await?;
         to_write -= chunk as u64;
+        let done = zero_total - to_write;
+        if done - last_log >= LOG_STEP {
+            info!("fmt: fat_fill {} / {}", done, zero_total);
+            last_log = done;
+        }
+        progress(done, zero_total);
     }
+    info!("fmt: fat_fill done {} bytes", zero_total);
     // mark entries at the end of FAT as used (after FAT but before sector end)
     let start_cluster = total_clusters + RESERVED_FAT_ENTRIES;
     let end_cluster = (bytes_per_fat * BITS_PER_BYTE / u64::from(fat_type.bits_per_fat_entry())) as u32;
