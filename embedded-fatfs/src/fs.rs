@@ -1298,27 +1298,21 @@ where
     let fat_pos = bpb.bytes_from_sectors(reserved_sectors);
     let sectors_per_all_fats = bpb.sectors_per_all_fats();
     storage.seek(SeekFrom::Start(fat_pos)).await?;
-    info!("fmt: fat_zero start, {} bytes", bpb.bytes_from_sectors(sectors_per_all_fats));
-    // Zero the FAT area with progress reporting — for real-world
-    // volumes this dominates format time, so mapping its byte counter
-    // to 0..=95 gives a useful progress indicator. See docs on
-    // `format_volume_with_progress`.
-    write_zeros_progress(
-        storage,
-        bpb.bytes_from_sectors(sectors_per_all_fats),
-        |done, total| {
-            let pct = if total == 0 { 95 } else { (done * 95 / total) as u8 };
-            progress(pct);
-        },
-    )
-    .await?;
-    info!("fmt: fat_zero done, format_fat");
+    // No separate bulk zero-fill step. `format_fat` now writes the
+    // free-cluster-entry range itself, one 512-byte chunk at a time
+    // through the fat_slice stream (which auto-mirrors to every FAT
+    // copy). This avoids multi-block CMD25 bursts that proved
+    // unreliable on the target SD card for sustained ~15 MB writes.
+    progress(5);
+    info!("fmt: format_fat ({} bytes per FAT × {} mirrors)", bpb.bytes_from_sectors(bpb.sectors_per_fat()), bpb.fats);
     {
         let mut fat_slice = fat_slice::<S, &mut S>(storage, bpb);
         let sectors_per_fat = bpb.sectors_per_fat();
         let bytes_per_fat = bpb.bytes_from_sectors(sectors_per_fat);
         format_fat(&mut fat_slice, fat_type, bpb.media, bytes_per_fat, bpb.total_clusters()).await?;
     }
+    progress(95);
+    info!("fmt: format_fat done");
 
     info!("fmt: root_dir zero");
     // init root directory - zero root directory region for FAT12/16 and alloc first root directory cluster for FAT32

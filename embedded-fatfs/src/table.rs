@@ -224,6 +224,32 @@ where
             fat.write_u32_le(0xFFFF_FFFF).await?;
         }
     };
+    // Fill the rest of the FAT (all "free cluster" entries and the
+    // tail padding) with zeros in 512-byte chunks. Each chunk goes
+    // through the underlying stream's fast path as a single-block
+    // write. Caller typically passes a `fat_slice` that automatically
+    // mirrors to every FAT copy, so one call here produces one
+    // CMD24 per FAT copy per chunk. We deliberately DO NOT use a
+    // bigger buffer: a previous bulk `write_zeros_progress` with
+    // 8 KiB chunks was triggering multi-block CMD25 bursts that
+    // this SD card could not recover from, ending in read/write
+    // failures after ~15 MB of sustained I/O. Single-block CMD24
+    // writes keep the card out of that state. Progress reporting
+    // is done by the caller at phase boundaries; there is no
+    // per-chunk callback here because this function is shared with
+    // callers that do not want coupling to a progress sink.
+    const ZEROS_CHUNK: [u8; 512] = [0_u8; 512];
+    let reserved_bytes: u64 = match fat_type {
+        FatType::Fat12 => 3,
+        FatType::Fat16 => 4,
+        FatType::Fat32 => 8,
+    };
+    let mut to_write = bytes_per_fat.saturating_sub(reserved_bytes);
+    while to_write > 0 {
+        let chunk = cmp::min(to_write, ZEROS_CHUNK.len() as u64) as usize;
+        fat.write_all(&ZEROS_CHUNK[..chunk]).await?;
+        to_write -= chunk as u64;
+    }
     // mark entries at the end of FAT as used (after FAT but before sector end)
     let start_cluster = total_clusters + RESERVED_FAT_ENTRIES;
     let end_cluster = (bytes_per_fat * BITS_PER_BYTE / u64::from(fat_type.bits_per_fat_entry())) as u32;
