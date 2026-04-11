@@ -219,16 +219,32 @@ where
         block_address: u32,
         data: &mut [Aligned<ALIGN, [u8; SIZE]>],
     ) -> Result<(), Error> {
+        let n = data.len();
         let r = async {
-            if data.len() == 1 {
-                self.cmd(read_single_block(block_address)).await?;
-                self.read_data(&mut data[0][..]).await?;
+            if n == 1 {
+                self.cmd(read_single_block(block_address)).await.map_err(|e| {
+                    error!("sdspi::read[single] CMD17 @ {}: {:?}", block_address, e);
+                    e
+                })?;
+                self.read_data(&mut data[0][..]).await.map_err(|e| {
+                    error!("sdspi::read[single] read_data @ {}: {:?}", block_address, e);
+                    e
+                })?;
             } else {
-                self.cmd(read_multiple_blocks(block_address)).await?;
-                for block in data {
-                    self.read_data(&mut block[..]).await?;
+                self.cmd(read_multiple_blocks(block_address)).await.map_err(|e| {
+                    error!("sdspi::read[multi] CMD18 @ {} n={}: {:?}", block_address, n, e);
+                    e
+                })?;
+                for (i, block) in data.iter_mut().enumerate() {
+                    self.read_data(&mut block[..]).await.map_err(|e| {
+                        error!("sdspi::read[multi] read_data block {} @ {}: {:?}", i, block_address, e);
+                        e
+                    })?;
                 }
-                self.cmd(stop_transmission()).await?;
+                self.cmd(stop_transmission()).await.map_err(|e| {
+                    error!("sdspi::read[multi] CMD12 @ {}: {:?}", block_address, e);
+                    e
+                })?;
             }
             Ok(())
         }
