@@ -293,7 +293,7 @@ where
         // Same rationale as `wait_idle` — yield between polls while
         // waiting for the data-start token so other async tasks on
         // the same executor are not starved.
-        let r = with_timeout(self.delay.clone(), 1000, async {
+        let outer = with_timeout(self.delay.clone(), 1000, async {
             let mut byte = self.read_byte().await?;
             while byte == 0xFF {
                 yield_now().await;
@@ -301,7 +301,11 @@ where
             }
             Ok(byte)
         })
-        .await??;
+        .await;
+        if let Err(Error::Timeout) = outer {
+            error!("sdspi: read_data data-start token wait timed out after 1000 ms");
+        }
+        let r = outer??;
 
         if r != DATA_START_BLOCK {
             return Err(Error::RegisterError(r));
@@ -376,15 +380,33 @@ where
                 .map_err(|_| Error::SpiError)?;
         }
 
-        let byte = with_timeout(self.delay.clone(), 1000, async {
+        // Use a mutable counter so a timeout report tells us whether
+        // the poll loop actually ran for the full window or was
+        // scheduler-starved. For the card to legitimately not
+        // respond, `polls` should be large.
+        let mut polls: u32 = 0;
+        // 10 s: the SD spec allows the card to defer command
+        // acceptance during background work (wear-leveling, GC).
+        // 1 s proved too tight under sustained write pressure during
+        // `format_volume` — CMD24 would time out after ~200 s of
+        // continuous writes even though the card was still alive.
+        let outer = with_timeout(self.delay.clone(), 10_000, async {
             loop {
                 let byte = self.read_byte().await?;
+                polls += 1;
                 if byte & 0x80 == 0 {
                     return Ok(byte);
                 }
             }
         })
-        .await??;
+        .await;
+        if let Err(Error::Timeout) = outer {
+            error!(
+                "sdspi: cmd {} response wait timed out after 10 s ({} polls)",
+                cmd.cmd, polls
+            );
+        }
+        let byte = outer??;
 
         Ok(byte)
     }
@@ -403,13 +425,17 @@ where
         // bus mutex, blocking display/radio work entirely. Yielding
         // once per poll lets the scheduler service other tasks between
         // checks at the cost of one scheduler round-trip per iteration.
-        with_timeout(self.delay.clone(), 5000, async {
+        let outer = with_timeout(self.delay.clone(), 5000, async {
             while self.read_byte().await? != 0xFF {
                 yield_now().await;
             }
             Ok(())
         })
-        .await?
+        .await;
+        if let Err(Error::Timeout) = outer {
+            error!("sdspi: wait_idle card-busy wait timed out after 5000 ms");
+        }
+        outer?
     }
 
     async fn read_byte(&mut self) -> Result<u8, Error> {
