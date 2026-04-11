@@ -196,47 +196,85 @@ where
     }
 }
 
-pub(crate) async fn format_fat<S, E>(
+pub(crate) async fn format_fat<S, E, F>(
     fat: &mut S,
     fat_type: FatType,
     media: u8,
     bytes_per_fat: u64,
-    total_clusters: u32,
+    _total_clusters: u32,
+    mut progress: F,
 ) -> Result<(), Error<E>>
 where
     S: Read + Write + Seek,
     E: IoError,
     Error<E>: From<S::Error> + From<ReadExactError<S::Error>>,
+    F: FnMut(u64, u64),
 {
-    const BITS_PER_BYTE: u64 = 8;
-    // init first two reserved entries to FAT ID
+    // Write the first 512-byte block as a complete unit: reserved
+    // entries at the front, zero-padded to a full block. This keeps
+    // the stream block-aligned so every subsequent write_all hits
+    // BufStream's fast path (direct CMD25 multi-block, no
+    // read-before-write). Previously writing 8 bytes of reserved
+    // entries first left the stream at offset 8, which forced EVERY
+    // subsequent 8 KiB chunk through the slow path (read + modify +
+    // flush per 512-byte block) — turning a 12-second operation into
+    // 6 minutes.
+    let mut first_block = [0u8; 512];
     match fat_type {
         FatType::Fat12 => {
-            fat.write_u8(media).await?;
-            fat.write_u16_le(0xFFFF).await?;
+            first_block[0] = media;
+            first_block[1] = 0xFF;
+            first_block[2] = 0xFF;
         }
         FatType::Fat16 => {
-            fat.write_u16_le(u16::from(media) | 0xFF00).await?;
-            fat.write_u16_le(0xFFFF).await?;
+            let e0 = (u16::from(media) | 0xFF00).to_le_bytes();
+            let e1 = 0xFFFFu16.to_le_bytes();
+            first_block[0..2].copy_from_slice(&e0);
+            first_block[2..4].copy_from_slice(&e1);
         }
         FatType::Fat32 => {
-            fat.write_u32_le(u32::from(media) | 0xFFF_FF00).await?;
-            fat.write_u32_le(0xFFFF_FFFF).await?;
+            let e0 = (u32::from(media) | 0x0FFF_FF00).to_le_bytes();
+            let e1 = 0x0FFF_FFFFu32.to_le_bytes();
+            first_block[0..4].copy_from_slice(&e0);
+            first_block[4..8].copy_from_slice(&e1);
         }
     };
-    // mark entries at the end of FAT as used (after FAT but before sector end)
-    let start_cluster = total_clusters + RESERVED_FAT_ENTRIES;
-    let end_cluster = (bytes_per_fat * BITS_PER_BYTE / u64::from(fat_type.bits_per_fat_entry())) as u32;
-    for cluster in start_cluster..end_cluster {
-        write_fat(fat, fat_type, cluster, FatValue::EndOfChain).await?;
-    }
-    // mark special entries 0x0FFFFFF0 - 0x0FFFFFFF as BAD if they exists on FAT32 volume
-    if end_cluster > 0x0FFF_FFF0 {
-        let end_bad_cluster = cmp::min(0x0FFF_FFFF + 1, end_cluster);
-        for cluster in 0x0FFF_FFF0..end_bad_cluster {
-            write_fat(fat, fat_type, cluster, FatValue::Bad).await?;
+    fat.write_all(&first_block).await?;
+
+    // Fill the rest of the FAT with zeros in 8 KiB chunks.
+    // Stream is now block-aligned → every chunk hits BufStream's
+    // fast path → single CMD25 multi-block write per chunk.
+    const ZEROS_CHUNK: [u8; 8192] = [0_u8; 8192];
+    let zero_total = bytes_per_fat - 512;
+    let mut to_write = zero_total;
+    let mut last_log = 0_u64;
+    const LOG_STEP: u64 = 512 * 1024;
+    progress(0, zero_total);
+    while to_write > 0 {
+        let chunk = cmp::min(to_write, ZEROS_CHUNK.len() as u64) as usize;
+        fat.write_all(&ZEROS_CHUNK[..chunk]).await?;
+        to_write -= chunk as u64;
+        let done = zero_total - to_write;
+        if done - last_log >= LOG_STEP {
+            trace!("fmt: fat_fill {} / {}", done, zero_total);
+            last_log = done;
         }
+        progress(done, zero_total);
     }
+    trace!("fmt: fat_fill done {} bytes", zero_total + 512);
+    // Tail-padding entries (start_cluster..end_cluster) and
+    // BAD-range markers are intentionally skipped. These entries
+    // sit beyond total_clusters + RESERVED_FAT_ENTRIES and are
+    // never reached by any alloc/free/lookup path. The fat_fill
+    // loop above already zeroed them, which means they read as
+    // "free" rather than "EndOfChain" — functionally equivalent
+    // because the allocator stops at total_clusters.
+    //
+    // The per-entry write_fat loop that used to live here caused
+    // mirror-write thrashing (fat_slice seeks between FAT1 and
+    // FAT2 for every 4-byte entry), which after 12 min of
+    // sustained I/O pushed the SD card past its programming
+    // timeout and triggered a BD Handler: Write error: Timeout.
     Ok(())
 }
 
