@@ -7,6 +7,7 @@ use core::fmt::Debug;
 use core::future::Future;
 use core::marker::PhantomData;
 use embassy_futures::select::{select, Either};
+use embassy_futures::yield_now;
 use sdio_host::sd::{CardCapacity, CID, CSD, OCR, SD};
 use sdio_host::{common_cmd::*, sd_cmd::*};
 
@@ -289,9 +290,13 @@ where
     }
 
     async fn read_data(&mut self, buffer: &mut [u8]) -> Result<(), Error> {
+        // Same rationale as `wait_idle` — yield between polls while
+        // waiting for the data-start token so other async tasks on
+        // the same executor are not starved.
         let r = with_timeout(self.delay.clone(), 1000, async {
-            let mut byte = 0xFF;
+            let mut byte = self.read_byte().await?;
             while byte == 0xFF {
+                yield_now().await;
                 byte = self.read_byte().await?;
             }
             Ok(byte)
@@ -391,8 +396,17 @@ where
     }
 
     async fn wait_idle(&mut self) -> Result<(), Error> {
+        // The card can hold the bus busy for 100+ ms during a
+        // write-programming cycle. Polling without `yield_now().await`
+        // starves every other async task on the same executor and, on
+        // shared-bus configurations, continuously reacquires the SPI
+        // bus mutex, blocking display/radio work entirely. Yielding
+        // once per poll lets the scheduler service other tasks between
+        // checks at the cost of one scheduler round-trip per iteration.
         with_timeout(self.delay.clone(), 5000, async {
-            while self.read_byte().await? != 0xFF {}
+            while self.read_byte().await? != 0xFF {
+                yield_now().await;
+            }
             Ok(())
         })
         .await?
