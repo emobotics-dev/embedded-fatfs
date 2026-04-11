@@ -1239,18 +1239,21 @@ where
         total_sectors_64 as u32 // safe case: possible overflow is handled above
     };
 
+    info!("fmt: boot_sector serialize");
     // Create boot sector, validate and write to storage device
     let (boot, fat_type) = format_boot_sector(&options, total_sectors, bytes_per_sector)?;
     if boot.validate::<S::Error>().is_err() {
         return Err(Error::InvalidInput);
     }
     boot.serialize(storage).await?;
+    info!("fmt: boot_sector pad");
     // Make sure entire logical sector is updated (serialize method always writes 512 bytes)
     let bytes_per_sector = boot.bpb.bytes_per_sector;
     write_zeros_until_end_of_sector(storage, bytes_per_sector).await?;
 
     let bpb = &boot.bpb;
     if bpb.is_fat32() {
+        info!("fmt: fs_info_sector seek");
         // FSInfo sector
         let fs_info_sector = FsInfoSector {
             free_cluster_count: None,
@@ -1260,22 +1263,29 @@ where
         storage
             .seek(SeekFrom::Start(bpb.bytes_from_sectors(bpb.fs_info_sector())))
             .await?;
+        info!("fmt: fs_info_sector serialize");
         fs_info_sector.serialize(storage).await?;
+        info!("fmt: fs_info_sector pad");
         write_zeros_until_end_of_sector(storage, bytes_per_sector).await?;
 
+        info!("fmt: backup_boot_sector seek");
         // backup boot sector
         storage
             .seek(SeekFrom::Start(bpb.bytes_from_sectors(bpb.backup_boot_sector())))
             .await?;
+        info!("fmt: backup_boot_sector serialize");
         boot.serialize(storage).await?;
+        info!("fmt: backup_boot_sector pad");
         write_zeros_until_end_of_sector(storage, bytes_per_sector).await?;
     }
 
+    info!("fmt: fat_area seek");
     // format File Allocation Table
     let reserved_sectors = bpb.reserved_sectors();
     let fat_pos = bpb.bytes_from_sectors(reserved_sectors);
     let sectors_per_all_fats = bpb.sectors_per_all_fats();
     storage.seek(SeekFrom::Start(fat_pos)).await?;
+    info!("fmt: fat_zero start, {} bytes", bpb.bytes_from_sectors(sectors_per_all_fats));
     // Zero the FAT area with progress reporting — for real-world
     // volumes this dominates format time, so mapping its byte counter
     // to 0..=95 gives a useful progress indicator. See docs on
@@ -1289,6 +1299,7 @@ where
         },
     )
     .await?;
+    info!("fmt: fat_zero done, format_fat");
     {
         let mut fat_slice = fat_slice::<S, &mut S>(storage, bpb);
         let sectors_per_fat = bpb.sectors_per_fat();
@@ -1296,6 +1307,7 @@ where
         format_fat(&mut fat_slice, fat_type, bpb.media, bytes_per_fat, bpb.total_clusters()).await?;
     }
 
+    info!("fmt: root_dir zero");
     // init root directory - zero root directory region for FAT12/16 and alloc first root directory cluster for FAT32
     let root_dir_first_sector = reserved_sectors + sectors_per_all_fats;
     let root_dir_sectors = bpb.root_dir_sectors();
@@ -1323,6 +1335,7 @@ where
         volume_entry.serialize(storage).await?;
     }
 
+    info!("fmt: final_flush");
     storage.flush().await?;
     storage.seek(SeekFrom::Start(0)).await?;
     progress(100);
