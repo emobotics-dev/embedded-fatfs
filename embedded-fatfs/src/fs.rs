@@ -962,6 +962,19 @@ where
     // get from 512-byte chunks and greatly reduces the card's
     // internal wear-leveling pressure during a full FAT zero-fill.
     const ZEROS: [u8; 8192] = [0_u8; 8192];
+    // One-shot: log the rodata alignment of ZEROS so we can tell
+    // whether BufStream's fast-path alignment check (usually
+    // requires 4-byte alignment) is satisfied. A `const [u8; N]`
+    // has only 1-byte alignment guaranteed by the language even if
+    // LLVM happens to place it higher in practice.
+    let zeros_ptr = ZEROS.as_ptr() as usize;
+    trace!(
+        "write_zeros_progress: len={} ZEROS.ptr={:#x} align4={} align8={}",
+        len,
+        zeros_ptr,
+        zeros_ptr % 4 == 0,
+        zeros_ptr % 8 == 0
+    );
     let total = len;
     let mut written: u64 = 0;
     while len > 0 {

@@ -178,21 +178,27 @@ impl<T: BlockDevice<SIZE>, const SIZE: usize> Write for BufStream<T, SIZE> {
             {
                 // If the provided buffer has a suitable length and alignment _and_ the write head is on a block boundary, use it directly
                 let block = self.pointer_block_start();
-                self.inner.write(block, slice_to_blocks(buf)).await?;
+                self.inner.write(block, slice_to_blocks(buf)).await.map_err(|e| {
+                    error!("BufStream::write FAST inner.write err @ block={} n={}", block, buf.len() / SIZE);
+                    e
+                })?;
 
                 buf.len()
             } else {
                 let block_start = self.pointer_block_start_addr();
                 let block_end = block_start + SIZE as u64;
                 trace!(
-                    "offset {}, block_start {}, block_end {}",
+                    "BufStream::write SLOW offset {}, block_start {}, block_end {}",
                     self.current_offset,
                     block_start,
                     block_end
                 );
 
                 // reload the cache if we need to
-                self.check_cache().await?;
+                self.check_cache().await.map_err(|e| {
+                    error!("BufStream::write SLOW check_cache err @ offset={}", self.current_offset);
+                    e
+                })?;
 
                 // copy as much as possible, up to the block boundary
                 let buffer_offset = (self.current_offset - block_start) as usize;
