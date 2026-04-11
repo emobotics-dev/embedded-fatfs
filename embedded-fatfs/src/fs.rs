@@ -935,12 +935,32 @@ impl OemCpConverter for LossyOemCpConverter {
     }
 }
 
-async fn write_zeros<IO: ReadWriteSeek>(disk: &mut IO, mut len: u64) -> Result<(), IO::Error> {
+async fn write_zeros<IO: ReadWriteSeek>(disk: &mut IO, len: u64) -> Result<(), IO::Error> {
+    write_zeros_progress(disk, len, |_, _| {}).await
+}
+
+/// Zero-fill `len` bytes at the current stream position, invoking
+/// `progress(bytes_written, total)` after each 512-byte chunk. Used by
+/// [`format_volume_with_progress`] to report the progress of the FAT
+/// zero-fill phase, which dominates format time for large volumes.
+async fn write_zeros_progress<IO, F>(
+    disk: &mut IO,
+    mut len: u64,
+    mut progress: F,
+) -> Result<(), IO::Error>
+where
+    IO: ReadWriteSeek,
+    F: FnMut(u64, u64),
+{
     const ZEROS: [u8; 512] = [0_u8; 512];
+    let total = len;
+    let mut written: u64 = 0;
     while len > 0 {
         let write_size = cmp::min(len, ZEROS.len() as u64) as usize;
         disk.write_all(&ZEROS[..write_size]).await?;
         len -= write_size as u64;
+        written += write_size as u64;
+        progress(written, total);
     }
     Ok(())
 }
@@ -1155,8 +1175,46 @@ pub async fn format_volume<S: ReadWriteSeek>(
     storage: &mut S,
     options: FormatVolumeOptions,
 ) -> Result<(), Error<S::Error>> {
+    format_volume_with_progress(storage, options, |_| {}).await
+}
+
+/// Formats the storage with the specified options, reporting coarse
+/// progress `0..=100` to `progress` during the FAT zero-fill phase.
+///
+/// The callback is invoked after every 512-byte chunk written during
+/// the FAT area zero-fill — typically many thousands of times per
+/// format. It is called synchronously (no `.await` between formatting
+/// work and the callback). The caller is responsible for any
+/// rate-limiting it needs: a trivial way is to remember the last
+/// reported percent and only act when the new percent is larger.
+///
+/// Progress mapping:
+/// * 0 on entry
+/// * scaled 0..=95 across the FAT zero-fill phase (the bulk of the
+///   time for any real-world volume)
+/// * 100 just before return
+///
+/// The small phases (BPB, FSInfo, format_fat, root-dir zero, label)
+/// are not individually reported — for any real card they are
+/// negligible compared to the FAT zero-fill.
+///
+/// # Errors
+///
+/// Same as [`format_volume`].
+#[allow(clippy::needless_pass_by_value)]
+pub async fn format_volume_with_progress<S, F>(
+    storage: &mut S,
+    options: FormatVolumeOptions,
+    mut progress: F,
+) -> Result<(), Error<S::Error>>
+where
+    S: ReadWriteSeek,
+    F: FnMut(u8),
+{
     trace!("format_volume");
     debug_assert!(storage.seek(SeekFrom::Current(0)).await? == 0);
+
+    progress(0);
 
     let bytes_per_sector = options.bytes_per_sector.unwrap_or(512);
     let total_sectors = if let Some(total_sectors) = options.total_sectors {
@@ -1209,7 +1267,19 @@ pub async fn format_volume<S: ReadWriteSeek>(
     let fat_pos = bpb.bytes_from_sectors(reserved_sectors);
     let sectors_per_all_fats = bpb.sectors_per_all_fats();
     storage.seek(SeekFrom::Start(fat_pos)).await?;
-    write_zeros(storage, bpb.bytes_from_sectors(sectors_per_all_fats)).await?;
+    // Zero the FAT area with progress reporting — for real-world
+    // volumes this dominates format time, so mapping its byte counter
+    // to 0..=95 gives a useful progress indicator. See docs on
+    // `format_volume_with_progress`.
+    write_zeros_progress(
+        storage,
+        bpb.bytes_from_sectors(sectors_per_all_fats),
+        |done, total| {
+            let pct = if total == 0 { 95 } else { (done * 95 / total) as u8 };
+            progress(pct);
+        },
+    )
+    .await?;
     {
         let mut fat_slice = fat_slice::<S, &mut S>(storage, bpb);
         let sectors_per_fat = bpb.sectors_per_fat();
@@ -1246,6 +1316,7 @@ pub async fn format_volume<S: ReadWriteSeek>(
 
     storage.flush().await?;
     storage.seek(SeekFrom::Start(0)).await?;
+    progress(100);
     trace!("format_volume end");
     Ok(())
 }
