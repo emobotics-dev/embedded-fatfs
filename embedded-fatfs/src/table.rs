@@ -201,7 +201,7 @@ pub(crate) async fn format_fat<S, E, F>(
     fat_type: FatType,
     media: u8,
     bytes_per_fat: u64,
-    total_clusters: u32,
+    _total_clusters: u32,
     mut progress: F,
 ) -> Result<(), Error<E>>
 where
@@ -240,7 +240,16 @@ where
     // is done by the caller at phase boundaries; there is no
     // per-chunk callback here because this function is shared with
     // callers that do not want coupling to a progress sink.
-    const ZEROS_CHUNK: [u8; 512] = [0_u8; 512];
+    // 8 KiB = 16 × 512-byte blocks. When the underlying storage is
+    // a BufStream backed by a real SD card, this hits the fast path
+    // and becomes a single CMD25 multi-block write with ACMD23
+    // pre-erase — roughly 10× faster than per-sector CMD24 writes.
+    // This is safe here because format_fat is now called once per FAT
+    // copy (no fat_slice mirroring), so the card sees a single
+    // continuous sequential write stream per FAT and does not hit the
+    // previously observed "post-burst read failure" at the
+    // multi-block → single-read transition.
+    const ZEROS_CHUNK: [u8; 8192] = [0_u8; 8192];
     let reserved_bytes: u64 = match fat_type {
         FatType::Fat12 => 3,
         FatType::Fat16 => 4,
