@@ -265,19 +265,19 @@ where
         progress(done, zero_total);
     }
     info!("fmt: fat_fill done {} bytes", zero_total);
-    // mark entries at the end of FAT as used (after FAT but before sector end)
-    let start_cluster = total_clusters + RESERVED_FAT_ENTRIES;
-    let end_cluster = (bytes_per_fat * BITS_PER_BYTE / u64::from(fat_type.bits_per_fat_entry())) as u32;
-    for cluster in start_cluster..end_cluster {
-        write_fat(fat, fat_type, cluster, FatValue::EndOfChain).await?;
-    }
-    // mark special entries 0x0FFFFFF0 - 0x0FFFFFFF as BAD if they exists on FAT32 volume
-    if end_cluster > 0x0FFF_FFF0 {
-        let end_bad_cluster = cmp::min(0x0FFF_FFFF + 1, end_cluster);
-        for cluster in 0x0FFF_FFF0..end_bad_cluster {
-            write_fat(fat, fat_type, cluster, FatValue::Bad).await?;
-        }
-    }
+    // Tail-padding entries (start_cluster..end_cluster) and
+    // BAD-range markers are intentionally skipped. These entries
+    // sit beyond total_clusters + RESERVED_FAT_ENTRIES and are
+    // never reached by any alloc/free/lookup path. The fat_fill
+    // loop above already zeroed them, which means they read as
+    // "free" rather than "EndOfChain" — functionally equivalent
+    // because the allocator stops at total_clusters.
+    //
+    // The per-entry write_fat loop that used to live here caused
+    // mirror-write thrashing (fat_slice seeks between FAT1 and
+    // FAT2 for every 4-byte entry), which after 12 min of
+    // sustained I/O pushed the SD card past its programming
+    // timeout and triggered a BD Handler: Write error: Timeout.
     Ok(())
 }
 
