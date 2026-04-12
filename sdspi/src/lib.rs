@@ -403,6 +403,15 @@ where
 
         let status = self.read_byte().await?;
         if (status & DATA_RES_MASK) != DATA_RES_ACCEPTED {
+            error!(
+                "sdspi: write_data rejected, status=0x{:02x} ({})",
+                status,
+                match status & DATA_RES_MASK {
+                    0x0B => "CRC error",
+                    0x0D => "write/program error",
+                    _ => "unknown",
+                }
+            );
             return Err(Error::WriteError);
         }
 
