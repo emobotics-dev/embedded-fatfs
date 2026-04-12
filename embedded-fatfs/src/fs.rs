@@ -1328,6 +1328,10 @@ where
         )
         .await?;
     }
+    // Flush any dirty BufStream block left by the last format_fat
+    // call before touching root-dir / alloc_cluster, which read from
+    // different regions and would evict the cached block.
+    storage.flush().await?;
     progress(95);
     info!("fmt: format_fat done");
 
