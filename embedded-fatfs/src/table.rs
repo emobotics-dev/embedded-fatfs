@@ -210,57 +210,45 @@ where
     Error<E>: From<S::Error> + From<ReadExactError<S::Error>>,
     F: FnMut(u64, u64),
 {
-    const BITS_PER_BYTE: u64 = 8;
-    // init first two reserved entries to FAT ID
+    // Write the first 512-byte block as a complete unit: reserved
+    // entries at the front, zero-padded to a full block. This keeps
+    // the stream block-aligned so every subsequent write_all hits
+    // BufStream's fast path (direct CMD25 multi-block, no
+    // read-before-write). Previously writing 8 bytes of reserved
+    // entries first left the stream at offset 8, which forced EVERY
+    // subsequent 8 KiB chunk through the slow path (read + modify +
+    // flush per 512-byte block) — turning a 12-second operation into
+    // 6 minutes.
+    let mut first_block = [0u8; 512];
     match fat_type {
         FatType::Fat12 => {
-            fat.write_u8(media).await?;
-            fat.write_u16_le(0xFFFF).await?;
+            first_block[0] = media;
+            first_block[1] = 0xFF;
+            first_block[2] = 0xFF;
         }
         FatType::Fat16 => {
-            fat.write_u16_le(u16::from(media) | 0xFF00).await?;
-            fat.write_u16_le(0xFFFF).await?;
+            let e0 = (u16::from(media) | 0xFF00).to_le_bytes();
+            let e1 = 0xFFFFu16.to_le_bytes();
+            first_block[0..2].copy_from_slice(&e0);
+            first_block[2..4].copy_from_slice(&e1);
         }
         FatType::Fat32 => {
-            fat.write_u32_le(u32::from(media) | 0xFFF_FF00).await?;
-            fat.write_u32_le(0xFFFF_FFFF).await?;
+            let e0 = (u32::from(media) | 0x0FFF_FF00).to_le_bytes();
+            let e1 = 0x0FFF_FFFFu32.to_le_bytes();
+            first_block[0..4].copy_from_slice(&e0);
+            first_block[4..8].copy_from_slice(&e1);
         }
     };
-    // Fill the rest of the FAT (all "free cluster" entries and the
-    // tail padding) with zeros in 512-byte chunks. Each chunk goes
-    // through the underlying stream's fast path as a single-block
-    // write. Caller typically passes a `fat_slice` that automatically
-    // mirrors to every FAT copy, so one call here produces one
-    // CMD24 per FAT copy per chunk. We deliberately DO NOT use a
-    // bigger buffer: a previous bulk `write_zeros_progress` with
-    // 8 KiB chunks was triggering multi-block CMD25 bursts that
-    // this SD card could not recover from, ending in read/write
-    // failures after ~15 MB of sustained I/O. Single-block CMD24
-    // writes keep the card out of that state. Progress reporting
-    // is done by the caller at phase boundaries; there is no
-    // per-chunk callback here because this function is shared with
-    // callers that do not want coupling to a progress sink.
-    // 8 KiB = 16 × 512-byte blocks. When the underlying storage is
-    // a BufStream backed by a real SD card, this hits the fast path
-    // and becomes a single CMD25 multi-block write with ACMD23
-    // pre-erase — roughly 10× faster than per-sector CMD24 writes.
-    // This is safe here because format_fat is now called once per FAT
-    // copy (no fat_slice mirroring), so the card sees a single
-    // continuous sequential write stream per FAT and does not hit the
-    // previously observed "post-burst read failure" at the
-    // multi-block → single-read transition.
+    fat.write_all(&first_block).await?;
+
+    // Fill the rest of the FAT with zeros in 8 KiB chunks.
+    // Stream is now block-aligned → every chunk hits BufStream's
+    // fast path → single CMD25 multi-block write per chunk.
     const ZEROS_CHUNK: [u8; 8192] = [0_u8; 8192];
-    let reserved_bytes: u64 = match fat_type {
-        FatType::Fat12 => 3,
-        FatType::Fat16 => 4,
-        FatType::Fat32 => 8,
-    };
-    let zero_total = bytes_per_fat.saturating_sub(reserved_bytes);
+    let zero_total = bytes_per_fat - 512;
     let mut to_write = zero_total;
     let mut last_log = 0_u64;
-    // Log every 64 KiB written so we can see progress on the UART
-    // even when the caller doesn't care about the `progress` callback.
-    const LOG_STEP: u64 = 64 * 1024;
+    const LOG_STEP: u64 = 512 * 1024;
     progress(0, zero_total);
     while to_write > 0 {
         let chunk = cmp::min(to_write, ZEROS_CHUNK.len() as u64) as usize;
@@ -273,7 +261,7 @@ where
         }
         progress(done, zero_total);
     }
-    info!("fmt: fat_fill done {} bytes", zero_total);
+    info!("fmt: fat_fill done {} bytes", zero_total + 512);
     // Tail-padding entries (start_cluster..end_cluster) and
     // BAD-range markers are intentionally skipped. These entries
     // sit beyond total_clusters + RESERVED_FAT_ENTRIES and are
