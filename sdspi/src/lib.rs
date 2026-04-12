@@ -369,15 +369,16 @@ where
             return Err(Error::RegisterError(r));
         }
 
+        // Read data block + 2 CRC bytes in one SpiDevice transaction
+        // so CS stays asserted for the entire data phase.
         buffer.fill(0xFF);
+        let mut crc_bytes = [0xFFu8; 2];
+        use embedded_hal_async::spi::Operation;
         self.spi
-            .transfer_in_place(buffer)
-            .await
-            .map_err(|_| Error::SpiError)?;
-
-        let mut crc_bytes = [0xFF; 2];
-        self.spi
-            .transfer_in_place(&mut crc_bytes)
+            .transaction(&mut [
+                Operation::TransferInPlace(buffer),
+                Operation::TransferInPlace(&mut crc_bytes),
+            ])
             .await
             .map_err(|_| Error::SpiError)?;
         let crc = u16::from_be_bytes(crc_bytes);
@@ -390,23 +391,31 @@ where
     }
 
     async fn write_data(&mut self, token: u8, buffer: &[u8]) -> Result<(), Error> {
-        self.spi
-            .write(&[token])
-            .await
-            .map_err(|_| Error::SpiError)?;
-        self.spi.write(buffer).await.map_err(|_| Error::SpiError)?;
+        // Send token + data + CRC + read data-response byte as one
+        // SpiDevice transaction. CS must stay asserted for the entire
+        // write-data phase per the SD SPI spec. Previously each part
+        // was a separate transaction and CS toggled between
+        // token/data/CRC/response, causing the card to return 0xFF
+        // (no data response) instead of the expected 0x05.
         let crc_bytes = crc16(buffer).to_be_bytes();
+        let token_buf = [token];
+        let mut status_buf = [0xFFu8; 1];
+        use embedded_hal_async::spi::Operation;
         self.spi
-            .write(&crc_bytes)
+            .transaction(&mut [
+                Operation::Write(&token_buf),
+                Operation::Write(buffer),
+                Operation::Write(&crc_bytes),
+                Operation::TransferInPlace(&mut status_buf),
+            ])
             .await
             .map_err(|_| Error::SpiError)?;
 
-        let status = self.read_byte().await?;
-        if (status & DATA_RES_MASK) != DATA_RES_ACCEPTED {
+        if (status_buf[0] & DATA_RES_MASK) != DATA_RES_ACCEPTED {
             error!(
                 "sdspi: write_data rejected, status=0x{:02x} ({})",
-                status,
-                match status & DATA_RES_MASK {
+                status_buf[0],
+                match status_buf[0] & DATA_RES_MASK {
                     0x0B => "CRC error",
                     0x0D => "write/program error",
                     _ => "unknown",
@@ -437,26 +446,37 @@ where
         ];
         buf[5] = crc7(&buf[0..5]);
 
-        self.spi.write(&buf).await.map_err(|_| Error::SpiError)?;
+        // Send command + read first R1 byte in one transaction so CS
+        // stays asserted across the command-to-response boundary.
+        let mut first = [0xFFu8; 1];
+        let mut stuff = [0xFFu8; 1];
 
-        // skip stuff byte for stop read
+        use embedded_hal_async::spi::Operation;
         if cmd.cmd == stop_transmission().cmd {
             self.spi
-                .transfer_in_place(&mut [0xFF])
+                .transaction(&mut [
+                    Operation::Write(&buf),
+                    Operation::TransferInPlace(&mut stuff),
+                    Operation::TransferInPlace(&mut first),
+                ])
+                .await
+                .map_err(|_| Error::SpiError)?;
+        } else {
+            self.spi
+                .transaction(&mut [
+                    Operation::Write(&buf),
+                    Operation::TransferInPlace(&mut first),
+                ])
                 .await
                 .map_err(|_| Error::SpiError)?;
         }
 
-        // Use a mutable counter so a timeout report tells us whether
-        // the poll loop actually ran for the full window or was
-        // scheduler-starved. For the card to legitimately not
-        // respond, `polls` should be large.
-        let mut polls: u32 = 0;
-        // 10 s: the SD spec allows the card to defer command
-        // acceptance during background work (wear-leveling, GC).
-        // 1 s proved too tight under sustained write pressure during
-        // `format_volume` — CMD24 would time out after ~200 s of
-        // continuous writes even though the card was still alive.
+        if first[0] & 0x80 == 0 {
+            return Ok(first[0]);
+        }
+
+        // Slow path: card needed more than one byte of NCR.
+        let mut polls: u32 = 1;
         let outer = with_timeout(self.delay.clone(), 10_000, async {
             loop {
                 let byte = self.read_byte().await?;
