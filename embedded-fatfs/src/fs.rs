@@ -1332,6 +1332,17 @@ where
     // call before touching root-dir / alloc_cluster, which read from
     // different regions and would evict the cached block.
     storage.flush().await?;
+    // After ~6 min of sustained writes the card's internal controller
+    // may need a moment to complete background operations (GC, wear
+    // leveling). A read of the boot sector acts as a sync barrier:
+    // CMD17 waits for the card to become ready, and completing a read
+    // confirms the card is responsive before we issue the next write.
+    // Without this, the first CMD24 after format_fat returns
+    // status=0xFF (card not in data-receive mode).
+    storage.seek(SeekFrom::Start(0)).await?;
+    let mut sync_buf = [0u8; 1];
+    storage.read(&mut sync_buf).await?;
+    info!("fmt: post-flush sync read OK (byte0=0x{:02x})", sync_buf[0]);
     progress(95);
     info!("fmt: format_fat done");
 
