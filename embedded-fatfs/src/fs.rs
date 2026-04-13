@@ -248,6 +248,10 @@ pub struct FsOptions<TP, OCC> {
     pub(crate) update_accessed_date: bool,
     pub(crate) oem_cp_converter: OCC,
     pub(crate) time_provider: TP,
+    /// Byte value written by erase (0x00 or 0xFF). When 0xFF, FAT
+    /// scanning treats all-0xFF entries as free and directory iteration
+    /// treats 0xFF first-byte as end-of-directory. Default: 0x00.
+    pub(crate) erased_byte: u8,
 }
 
 impl FsOptions<DefaultTimeProvider, LossyOemCpConverter> {
@@ -258,6 +262,7 @@ impl FsOptions<DefaultTimeProvider, LossyOemCpConverter> {
             update_accessed_date: false,
             oem_cp_converter: LossyOemCpConverter::new(),
             time_provider: DefaultTimeProvider::new(),
+            erased_byte: 0x00,
         }
     }
 }
@@ -276,6 +281,7 @@ impl<TP: TimeProvider, OCC: OemCpConverter> FsOptions<TP, OCC> {
             update_accessed_date: self.update_accessed_date,
             oem_cp_converter,
             time_provider: self.time_provider,
+            erased_byte: self.erased_byte,
         }
     }
 
@@ -285,7 +291,21 @@ impl<TP: TimeProvider, OCC: OemCpConverter> FsOptions<TP, OCC> {
             update_accessed_date: self.update_accessed_date,
             oem_cp_converter: self.oem_cp_converter,
             time_provider,
+            erased_byte: self.erased_byte,
         }
+    }
+
+    /// Set the byte value that erase produces on this device.
+    ///
+    /// When set to `0xFF`, FAT scanning treats all-0xFF entries as
+    /// free clusters, and directory iteration treats `0xFF` as
+    /// end-of-directory. Use after formatting with
+    /// [`FormatVolumeOptions::pre_erased`] on a device that erases
+    /// to 0xFF.
+    #[must_use]
+    pub fn erased_byte(mut self, byte: u8) -> Self {
+        self.erased_byte = byte;
+        self
     }
 }
 
@@ -510,7 +530,7 @@ impl<IO: ReadWriteSeek, TP, OCC> FileSystem<IO, TP, OCC> {
         let hint = self.fs_info.borrow().next_free_cluster;
         let cluster = {
             let mut fat = self.fat_slice();
-            alloc_cluster(&mut fat, self.fat_type, prev_cluster, hint, self.total_clusters).await?
+            alloc_cluster(&mut fat, self.fat_type, prev_cluster, hint, self.total_clusters, self.options.erased_byte).await?
         };
         if zero {
             let mut disk = self.disk.as_ref().ok_or(Error::DiskNotMounted)?.borrow_mut();
@@ -562,7 +582,7 @@ impl<IO: ReadWriteSeek, TP, OCC> FileSystem<IO, TP, OCC> {
     /// Forces free clusters recalculation.
     async fn recalc_free_clusters(&self) -> Result<u32, Error<IO::Error>> {
         let mut fat = self.fat_slice();
-        let free_cluster_count = count_free_clusters(&mut fat, self.fat_type, self.total_clusters).await?;
+        let free_cluster_count = count_free_clusters(&mut fat, self.fat_type, self.total_clusters, self.options.erased_byte).await?;
         self.fs_info.borrow_mut().set_free_cluster_count(free_cluster_count);
         Ok(free_cluster_count)
     }
@@ -1375,13 +1395,13 @@ where
     let root_dir_sectors = bpb.root_dir_sectors();
     let root_dir_pos = bpb.bytes_from_sectors(root_dir_first_sector);
     storage.seek(SeekFrom::Start(root_dir_pos)).await?;
-    if !options.pre_erased {
-        write_zeros(storage, bpb.bytes_from_sectors(root_dir_sectors)).await?;
-    }
+    // Always zero the root directory — it's small (typically 16 KB)
+    // and 0xFF entries would need special handling in dir iteration.
+    write_zeros(storage, bpb.bytes_from_sectors(root_dir_sectors)).await?;
     if fat_type == FatType::Fat32 {
         let root_dir_first_cluster = {
             let mut fat_slice = fat_slice::<S, &mut S>(storage, bpb);
-            alloc_cluster(&mut fat_slice, fat_type, None, None, 1).await?
+            alloc_cluster(&mut fat_slice, fat_type, None, None, 1, 0).await?
         };
         assert!(root_dir_first_cluster == bpb.root_dir_first_cluster);
         let first_data_sector = reserved_sectors + sectors_per_all_fats + root_dir_sectors;
@@ -1389,9 +1409,7 @@ where
         let fat32_root_dir_first_sector = first_data_sector + data_sectors_before_root_dir;
         let fat32_root_dir_pos = bpb.bytes_from_sectors(fat32_root_dir_first_sector);
         storage.seek(SeekFrom::Start(fat32_root_dir_pos)).await?;
-        if !options.pre_erased {
-            write_zeros(storage, u64::from(bpb.cluster_size())).await?;
-        }
+        write_zeros(storage, u64::from(bpb.cluster_size())).await?;
     }
 
     // Create volume label directory entry if volume label is specified in options
