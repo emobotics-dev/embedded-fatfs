@@ -282,7 +282,11 @@ impl DirFileEntryData {
     }
 
     pub(crate) fn is_end(&self) -> bool {
-        self.name[0] == 0
+        // 0x00 = standard end-of-directory marker.
+        // 0xFF = erased but never written — treat as end so
+        // pre_erased format works on devices that erase to 0xFF.
+        // 0xFF is never a valid SFN first byte on a real FS.
+        self.name[0] == 0 || self.name[0] == 0xFF
     }
 
     pub(crate) fn is_volume(&self) -> bool {
@@ -363,7 +367,7 @@ impl DirLfnEntryData {
     }
 
     pub(crate) fn is_end(&self) -> bool {
-        self.order == 0
+        self.order == 0 || self.order == 0xFF
     }
 }
 
