@@ -4,7 +4,7 @@ use core::marker::PhantomData;
 
 use crate::error::{Error, IoError, ReadExactError};
 use crate::fs::{FatType, FsStatusFlags};
-use crate::io::{self, IoBase, Read, ReadLeExt, Seek, Write, WriteLeExt};
+use crate::io::{self, IoBase, Read, ReadLeExt, Seek, SeekFrom, Write, WriteLeExt};
 
 struct Fat<S> {
     phantom: PhantomData<S>,
@@ -209,6 +209,7 @@ pub(crate) async fn format_fat<S, E, F>(
     media: u8,
     bytes_per_fat: u64,
     _total_clusters: u32,
+    pre_erased: bool,
     mut progress: F,
 ) -> Result<(), Error<E>>
 where
@@ -248,27 +249,37 @@ where
     };
     fat.write_all(&first_block).await?;
 
-    // Fill the rest of the FAT with zeros in 8 KiB chunks.
-    // Stream is now block-aligned → every chunk hits BufStream's
-    // fast path → single CMD25 multi-block write per chunk.
-    const ZEROS_CHUNK: [u8; 8192] = [0_u8; 8192];
     let zero_total = bytes_per_fat - 512;
-    let mut to_write = zero_total;
-    let mut last_log = 0_u64;
-    const LOG_STEP: u64 = 512 * 1024;
-    progress(0, zero_total);
-    while to_write > 0 {
-        let chunk = cmp::min(to_write, ZEROS_CHUNK.len() as u64) as usize;
-        fat.write_all(&ZEROS_CHUNK[..chunk]).await?;
-        to_write -= chunk as u64;
-        let done = zero_total - to_write;
-        if done - last_log >= LOG_STEP {
-            trace!("fmt: fat_fill {} / {}", done, zero_total);
-            last_log = done;
+
+    if pre_erased {
+        // Device was erased before format — skip zero-fill entirely.
+        // Seek past the FAT body so the stream position is correct
+        // for the caller.
+        fat.seek(SeekFrom::Current(zero_total as i64)).await?;
+        trace!("fmt: fat_fill skipped (pre_erased), {} bytes", zero_total);
+        progress(zero_total, zero_total);
+    } else {
+        // Fill the rest of the FAT with zeros in 8 KiB chunks.
+        // Stream is now block-aligned → every chunk hits BufStream's
+        // fast path → single CMD25 multi-block write per chunk.
+        const ZEROS_CHUNK: [u8; 8192] = [0_u8; 8192];
+        let mut to_write = zero_total;
+        let mut last_log = 0_u64;
+        const LOG_STEP: u64 = 512 * 1024;
+        progress(0, zero_total);
+        while to_write > 0 {
+            let chunk = cmp::min(to_write, ZEROS_CHUNK.len() as u64) as usize;
+            fat.write_all(&ZEROS_CHUNK[..chunk]).await?;
+            to_write -= chunk as u64;
+            let done = zero_total - to_write;
+            if done - last_log >= LOG_STEP {
+                trace!("fmt: fat_fill {} / {}", done, zero_total);
+                last_log = done;
+            }
+            progress(done, zero_total);
         }
-        progress(done, zero_total);
+        trace!("fmt: fat_fill done {} bytes", zero_total + 512);
     }
-    trace!("fmt: fat_fill done {} bytes", zero_total + 512);
     // Tail-padding entries (start_cluster..end_cluster) and
     // BAD-range markers are intentionally skipped. These entries
     // sit beyond total_clusters + RESERVED_FAT_ENTRIES and are

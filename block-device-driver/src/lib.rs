@@ -74,6 +74,23 @@ impl<T: BlockDevice<SIZE>, const SIZE: usize> BlockDevice<SIZE> for &mut T {
     }
 }
 
+/// Stream-level erase — implemented by adapters (e.g. `BufStream`)
+/// that wrap a [`BlockDevice`] supporting erase.
+///
+/// Separate from `BlockDevice` so it can be used as a bound on
+/// byte-stream consumers (`Read + Write + Seek + Erase`) without
+/// pulling in the block-level generics.
+pub trait Erase {
+    /// Error type for erase operations.
+    type Error: core::fmt::Debug;
+
+    /// Erase the block range `[start_block, end_block]` (inclusive).
+    ///
+    /// After erase, block content is device-dependent (0x00 or 0xFF).
+    /// No-op if the underlying device does not support erase.
+    async fn erase_blocks(&mut self, start_block: u32, end_block: u32) -> Result<(), Self::Error>;
+}
+
 /// Cast a byte slice to an aligned slice of blocks.
 ///
 /// This function panics if

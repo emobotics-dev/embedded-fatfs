@@ -1018,6 +1018,7 @@ pub struct FormatVolumeOptions {
     pub(crate) drive_num: Option<u8>,
     pub(crate) volume_id: Option<u32>,
     pub(crate) volume_label: Option<[u8; SFN_SIZE]>,
+    pub(crate) pre_erased: bool,
 }
 
 impl FormatVolumeOptions {
@@ -1166,6 +1167,26 @@ impl FormatVolumeOptions {
     #[must_use]
     pub fn volume_label(mut self, volume_label: [u8; SFN_SIZE]) -> Self {
         self.volume_label = Some(volume_label);
+        self
+    }
+
+    /// Indicate that the device has been erased before formatting.
+    ///
+    /// When set, `format_volume` skips the FAT zero-fill and root
+    /// directory zeroing — only structural bytes (BPB, FAT reserved
+    /// entries, volume label) are written. This eliminates the
+    /// sustained write pressure that causes SD card GC stalls.
+    ///
+    /// The caller **must** erase the entire volume before calling
+    /// `format_volume` with this flag. If the device erases to 0xFF
+    /// rather than 0x00, the FAT body will contain 0xFF entries
+    /// (interpreted as allocated/end-of-chain), which is incorrect.
+    /// Use only when the device erases to 0x00 or when correctness
+    /// of unused FAT entries is not required (e.g. the volume will
+    /// be used immediately after format with no free-space queries).
+    #[must_use]
+    pub fn pre_erased(mut self) -> Self {
+        self.pre_erased = true;
         self
     }
 }
@@ -1319,7 +1340,8 @@ where
             bpb.media,
             bytes_per_fat,
             total_clusters,
-            |done, total| {
+            options.pre_erased,
+            |done, _total| {
                 let base = u64::from(fat_idx) * bytes_per_fat;
                 let total_all = bytes_per_fat * u64::from(fats);
                 let pct = if total_all == 0 { 95 } else { ((base + done) * 95 / total_all) as u8 };
@@ -1342,7 +1364,7 @@ where
     storage.seek(SeekFrom::Start(0)).await?;
     let mut sync_buf = [0u8; 1];
     storage.read(&mut sync_buf).await?;
-    info!("fmt: post-flush sync read OK (byte0=0x{:02x})", sync_buf[0]);
+    trace!("fmt: post-flush sync read OK (byte0=0x{:02x})", sync_buf[0]);
     progress(95);
     trace!("fmt: format_fat done");
 
@@ -1353,7 +1375,9 @@ where
     let root_dir_sectors = bpb.root_dir_sectors();
     let root_dir_pos = bpb.bytes_from_sectors(root_dir_first_sector);
     storage.seek(SeekFrom::Start(root_dir_pos)).await?;
-    write_zeros(storage, bpb.bytes_from_sectors(root_dir_sectors)).await?;
+    if !options.pre_erased {
+        write_zeros(storage, bpb.bytes_from_sectors(root_dir_sectors)).await?;
+    }
     if fat_type == FatType::Fat32 {
         let root_dir_first_cluster = {
             let mut fat_slice = fat_slice::<S, &mut S>(storage, bpb);
@@ -1365,7 +1389,9 @@ where
         let fat32_root_dir_first_sector = first_data_sector + data_sectors_before_root_dir;
         let fat32_root_dir_pos = bpb.bytes_from_sectors(fat32_root_dir_first_sector);
         storage.seek(SeekFrom::Start(fat32_root_dir_pos)).await?;
-        write_zeros(storage, u64::from(bpb.cluster_size())).await?;
+        if !options.pre_erased {
+            write_zeros(storage, u64::from(bpb.cluster_size())).await?;
+        }
     }
 
     // Create volume label directory entry if volume label is specified in options
