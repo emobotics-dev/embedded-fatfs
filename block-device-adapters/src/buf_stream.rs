@@ -250,6 +250,20 @@ impl<T: BlockDevice<SIZE>, const SIZE: usize> Seek for BufStream<T, SIZE> {
     }
 }
 
+impl<T, const SIZE: usize> block_device_driver::Erase for BufStream<T, SIZE>
+where
+    T: BlockDevice<SIZE> + block_device_driver::Erase<Error = <T as BlockDevice<SIZE>>::Error>,
+{
+    type Error = BufStreamError<<T as BlockDevice<SIZE>>::Error>;
+
+    async fn erase_blocks(&mut self, start_block: u32, end_block: u32) -> Result<(), Self::Error> {
+        self.flush().await?;
+        self.inner.erase_blocks(start_block, end_block).await?;
+        self.current_block = u32::MAX;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use aligned::A4;

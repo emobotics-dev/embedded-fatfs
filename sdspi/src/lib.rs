@@ -68,6 +68,7 @@ pub enum Error {
     CrcMismatch(u16, u16),
     NotInitialized,
     WriteError,
+    EraseError,
 }
 
 /// Must be called between powerup and [SdSpi::init] to ensure the sdcard is properly initialized.
@@ -347,6 +348,39 @@ where
         Ok(self.card.ok_or(Error::NotInitialized)?.size())
     }
 
+    /// Erase blocks in the range `[start_block, end_block]` (inclusive).
+    ///
+    /// Sends CMD32 (ERASE_WR_BLK_START), CMD33 (ERASE_WR_BLK_END),
+    /// CMD38 (ERASE). The card performs the erase internally — orders
+    /// of magnitude faster than writing zeros over SPI. After erase,
+    /// blocks contain 0x00 or 0xFF depending on the card.
+    pub async fn erase(&mut self, start_block: u32, end_block: u32) -> Result<(), Error> {
+        self.card.ok_or(Error::NotInitialized)?;
+
+        let r = self.cmd(cmd::<R1>(32, start_block)).await?;
+        if r != R1_READY_STATE {
+            error!("sdspi::erase CMD32 R1=0x{:02x}", r);
+            return Err(Error::EraseError);
+        }
+
+        let r = self.cmd(cmd::<R1>(33, end_block)).await?;
+        if r != R1_READY_STATE {
+            error!("sdspi::erase CMD33 R1=0x{:02x}", r);
+            return Err(Error::EraseError);
+        }
+
+        let r = self.cmd(cmd::<R1>(38, 0)).await?;
+        if r != R1_READY_STATE {
+            error!("sdspi::erase CMD38 R1=0x{:02x}", r);
+            return Err(Error::EraseError);
+        }
+
+        // CMD38 returns R1b — card holds busy until erase completes
+        self.wait_idle().await?;
+
+        Ok(())
+    }
+
     async fn read_data(&mut self, buffer: &mut [u8]) -> Result<(), Error> {
         // Same rationale as `wait_idle` — yield between polls while
         // waiting for the data-start token so other async tasks on
@@ -564,6 +598,19 @@ where
 
     async fn size(&mut self) -> Result<u64, Self::Error> {
         self.size().await
+    }
+}
+
+impl<SPI, D, ALIGN> block_device_driver::Erase for SdSpi<SPI, D, ALIGN>
+where
+    SPI: embedded_hal_async::spi::SpiDevice,
+    D: embedded_hal_async::delay::DelayNs + Clone,
+    ALIGN: aligned::Alignment,
+{
+    type Error = Error;
+
+    async fn erase_blocks(&mut self, start_block: u32, end_block: u32) -> Result<(), Self::Error> {
+        self.erase(start_block, end_block).await
     }
 }
 
