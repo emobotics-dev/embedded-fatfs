@@ -76,12 +76,22 @@ where
     }
 }
 
-async fn write_fat<S, E>(fat: &mut S, fat_type: FatType, cluster: u32, value: FatValue) -> Result<(), Error<E>>
+async fn write_fat<S, E>(fat: &mut S, fat_type: FatType, cluster: u32, value: FatValue, erased_byte: u8) -> Result<(), Error<E>>
 where
     S: Read + Write + Seek,
     E: IoError,
     Error<E>: From<S::Error> + From<ReadExactError<S::Error>>,
 {
+    // When erased_byte is 0xFF on FAT32, write EndOfChain as
+    // 0x0FFFFFF8 (not 0x0FFFFFFF) so find_free can distinguish
+    // allocated clusters from erased (free) ones. Both values
+    // are valid EndOfChain per the FAT spec.
+    let value = if erased_byte == 0xFF && value == FatValue::EndOfChain {
+        assert!(fat_type == FatType::Fat32, "erased_byte(0xFF) only supported on FAT32");
+        FatValue::Data(0x0FFF_FFF8)
+    } else {
+        value
+    };
     trace!("write FAT - cluster {} value {:?}", cluster, value);
     match fat_type {
         FatType::Fat12 => Fat12::set(fat, cluster, value).await,
@@ -104,14 +114,22 @@ where
 }
 
 /// Check if a FAT entry value represents a free cluster.
-/// When `erased_byte` is 0xFF, the all-ones value for each FAT type
-/// (0xFFF / 0xFFFF / 0x0FFFFFFF) is also treated as free — these are
-/// unwritten entries on a device that erases to 0xFF.
-fn is_free_fat12(val: u16, erased_byte: u8) -> bool {
-    val == 0 || (erased_byte == 0xFF && val == 0x0FFF)
+///
+/// FAT32 with `erased_byte == 0xFF`: the all-ones value `0x0FFFFFFF`
+/// is also treated as free — these are unwritten entries on a device
+/// that erases to 0xFF. This works because `Fat32::set` writes
+/// `0x0FFFFFF8` (not `0x0FFFFFFF`) for EndOfChain when erased_byte
+/// is 0xFF, so the two values are distinguishable.
+///
+/// FAT12/FAT16: erased_byte 0xFF is not supported — the EndOfChain
+/// marker (0xFFF / 0xFFFF) collides with the erased value and cannot
+/// be disambiguated without changing the written EndOfChain, which
+/// would require a different approach for the 12-bit packed format.
+fn is_free_fat12(val: u16) -> bool {
+    val == 0
 }
-fn is_free_fat16(val: u16, erased_byte: u8) -> bool {
-    val == 0 || (erased_byte == 0xFF && val == 0xFFFF)
+fn is_free_fat16(val: u16) -> bool {
+    val == 0
 }
 fn is_free_fat32(val: u32, erased_byte: u8) -> bool {
     val == 0 || (erased_byte == 0xFF && val == 0x0FFF_FFFF)
@@ -161,9 +179,9 @@ where
         }
         Err(e) => return Err(e),
     };
-    write_fat(fat, fat_type, new_cluster, FatValue::EndOfChain).await?;
+    write_fat(fat, fat_type, new_cluster, FatValue::EndOfChain, erased_byte).await?;
     if let Some(n) = prev_cluster {
-        write_fat(fat, fat_type, n, FatValue::Data(new_cluster)).await?;
+        write_fat(fat, fat_type, n, FatValue::Data(new_cluster), erased_byte).await?;
     }
     trace!("allocated cluster {}", new_cluster);
     Ok(new_cluster)
@@ -370,7 +388,7 @@ impl FatTrait for Fat12 {
         Ok(())
     }
 
-    async fn find_free<S, E>(fat: &mut S, start_cluster: u32, end_cluster: u32, erased_byte: u8) -> Result<u32, Error<E>>
+    async fn find_free<S, E>(fat: &mut S, start_cluster: u32, end_cluster: u32, _erased_byte: u8) -> Result<u32, Error<E>>
     where
         S: Read + Seek,
         E: IoError,
@@ -385,7 +403,7 @@ impl FatTrait for Fat12 {
                 0 => packed_val & 0x0FFF,
                 _ => packed_val >> 4,
             };
-            if is_free_fat12(val, erased_byte) {
+            if is_free_fat12(val) {
                 return Ok(cluster);
             }
             cluster += 1;
@@ -401,7 +419,7 @@ impl FatTrait for Fat12 {
         }
     }
 
-    async fn count_free<S, E>(fat: &mut S, end_cluster: u32, erased_byte: u8) -> Result<u32, Error<E>>
+    async fn count_free<S, E>(fat: &mut S, end_cluster: u32, _erased_byte: u8) -> Result<u32, Error<E>>
     where
         S: Read + Seek,
         E: IoError,
@@ -425,7 +443,7 @@ impl FatTrait for Fat12 {
                 _ => (packed_val << 8) | (prev_packed_val >> 12),
             };
             prev_packed_val = packed_val;
-            if is_free_fat12(val, erased_byte) {
+            if is_free_fat12(val) {
                 count += 1;
             }
             cluster += 1;
@@ -475,7 +493,7 @@ impl FatTrait for Fat16 {
         Self::set_raw(fat, cluster, raw_value).await
     }
 
-    async fn find_free<S, E>(fat: &mut S, start_cluster: u32, end_cluster: u32, erased_byte: u8) -> Result<u32, Error<E>>
+    async fn find_free<S, E>(fat: &mut S, start_cluster: u32, end_cluster: u32, _erased_byte: u8) -> Result<u32, Error<E>>
     where
         S: Read + Seek,
         E: IoError,
@@ -485,7 +503,7 @@ impl FatTrait for Fat16 {
         fat.seek(io::SeekFrom::Start(u64::from(cluster * 2))).await?;
         while cluster < end_cluster {
             let val = fat.read_u16_le().await?;
-            if is_free_fat16(val, erased_byte) {
+            if is_free_fat16(val) {
                 return Ok(cluster);
             }
             cluster += 1;
@@ -493,7 +511,7 @@ impl FatTrait for Fat16 {
         Err(Error::NotEnoughSpace)
     }
 
-    async fn count_free<S, E>(fat: &mut S, end_cluster: u32, erased_byte: u8) -> Result<u32, Error<E>>
+    async fn count_free<S, E>(fat: &mut S, end_cluster: u32, _erased_byte: u8) -> Result<u32, Error<E>>
     where
         S: Read + Seek,
         E: IoError,
@@ -504,7 +522,7 @@ impl FatTrait for Fat16 {
         fat.seek(io::SeekFrom::Start(u64::from(cluster * 2))).await?;
         while cluster < end_cluster {
             let val = fat.read_u16_le().await?;
-            if is_free_fat16(val, erased_byte) {
+            if is_free_fat16(val) {
                 count += 1;
             }
             cluster += 1;
@@ -580,9 +598,6 @@ impl FatTrait for Fat32 {
         let old_reserved_bits = Self::get_raw(fat, cluster).await? & 0xF000_0000;
 
         if value == FatValue::Free && (0x0FFF_FFF7..=0x0FFF_FFFF).contains(&cluster) {
-            // NOTE: it is technically allowed for them to store FAT chain loops,
-            //       or even have them all store value '4' as their next cluster.
-            //       Some believe only FatValue::Bad should be allowed for this edge case.
             let tmp = if cluster == 0x0FFF_FFF7 {
                 "BAD_CLUSTER"
             } else {
@@ -656,6 +671,7 @@ pub(crate) struct ClusterIterator<B, E, S = B> {
     fat: B,
     fat_type: FatType,
     cluster: Option<u32>,
+    erased_byte: u8,
     err: bool,
     // phantom is needed to add type bounds on the storage type
     phantom_s: PhantomData<S>,
@@ -669,11 +685,12 @@ where
     S: Read + Write + Seek,
     Error<E>: From<S::Error> + From<ReadExactError<S::Error>>,
 {
-    pub(crate) fn new(fat: B, fat_type: FatType, cluster: u32) -> Self {
+    pub(crate) fn new(fat: B, fat_type: FatType, cluster: u32, erased_byte: u8) -> Self {
         Self {
             fat,
             fat_type,
             cluster: Some(cluster),
+            erased_byte,
             err: false,
             phantom_s: PhantomData,
             phantom_e: PhantomData,
@@ -685,7 +702,7 @@ where
             // Move to the next cluster
             self.next().await;
             // Mark previous cluster as end of chain
-            write_fat(self.fat.borrow_mut(), self.fat_type, n, FatValue::EndOfChain).await?;
+            write_fat(self.fat.borrow_mut(), self.fat_type, n, FatValue::EndOfChain, self.erased_byte).await?;
             // Free rest of chain
             self.free().await
         } else {
@@ -697,7 +714,7 @@ where
         let mut num_free = 0;
         while let Some(n) = self.cluster {
             self.next().await;
-            write_fat(self.fat.borrow_mut(), self.fat_type, n, FatValue::Free).await?;
+            write_fat(self.fat.borrow_mut(), self.fat_type, n, FatValue::Free, self.erased_byte).await?;
             num_free += 1;
         }
         Ok(num_free)
@@ -772,7 +789,7 @@ mod tests {
         assert_eq!(count_free_clusters(&mut cur, fat_type, 0x1E, 0).await.ok(), Some(3));
         // test reading from iterator
         {
-            let mut iter = ClusterIterator::<&mut S, S::Error, S>::new(&mut cur, fat_type, 0x9);
+            let mut iter = ClusterIterator::<&mut S, S::Error, S>::new(&mut cur, fat_type, 0x9, 0);
             let actual_cluster_numbers = {
                 let mut v = Vec::new();
                 while let Some(i) = iter.next().await {
@@ -790,7 +807,7 @@ mod tests {
         }
         // test truncating a chain
         {
-            let mut iter = ClusterIterator::<&mut S, S::Error, S>::new(&mut cur, fat_type, 0x9);
+            let mut iter = ClusterIterator::<&mut S, S::Error, S>::new(&mut cur, fat_type, 0x9, 0);
             iter.next().await;
             iter.next().await;
             iter.next().await;
@@ -806,7 +823,7 @@ mod tests {
         assert_eq!(read_fat(&mut cur, fat_type, 0x1A).await.ok(), Some(FatValue::Free));
         // test freeing a chain
         {
-            let mut iter = ClusterIterator::<&mut S, S::Error, S>::new(&mut cur, fat_type, 0x9);
+            let mut iter = ClusterIterator::<&mut S, S::Error, S>::new(&mut cur, fat_type, 0x9, 0);
             assert!(iter.free().await.is_ok());
         }
         assert_eq!(read_fat(&mut cur, fat_type, 0x9).await.ok(), Some(FatValue::Free));
