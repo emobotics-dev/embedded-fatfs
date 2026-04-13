@@ -414,6 +414,11 @@ impl<IO: ReadWriteSeek, TP, OCC> FileSystem<IO, TP, OCC> {
         let total_clusters = bpb.total_clusters();
         let fat_type = FatType::from_clusters(total_clusters);
 
+        assert!(
+            options.erased_byte == 0x00 || fat_type == FatType::Fat32,
+            "erased_byte(0xFF) only supported on FAT32 volumes"
+        );
+
         // read FSInfo sector if this is FAT32
         let mut fs_info = if fat_type == FatType::Fat32 {
             disk.seek(SeekFrom::Start(bpb.bytes_from_sectors(bpb.fs_info_sector())))
@@ -506,7 +511,7 @@ impl<IO: ReadWriteSeek, TP, OCC> FileSystem<IO, TP, OCC> {
         cluster: u32,
     ) -> ClusterIterator<impl ReadWriteSeek<Error = Error<IO::Error>> + '_, IO::Error> {
         let disk_slice = self.fat_slice();
-        ClusterIterator::new(disk_slice, self.fat_type, cluster)
+        ClusterIterator::new(disk_slice, self.fat_type, cluster, self.options.erased_byte)
     }
 
     pub(crate) async fn truncate_cluster_chain(&self, cluster: u32) -> Result<(), Error<IO::Error>> {
@@ -1353,6 +1358,15 @@ where
     for fat_idx in 0..fats {
         let fat_start = fat_pos + u64::from(fat_idx) * bytes_per_fat;
         trace!("fmt: format_fat[{}] @ offset {} ({} bytes)", fat_idx, fat_start, bytes_per_fat);
+        // After a large erase, the card may need a sync barrier
+        // before accepting writes to a new region.
+        if options.pre_erased && fat_idx > 0 {
+            storage.flush().await?;
+            storage.seek(SeekFrom::Start(0)).await?;
+            let mut sync = [0u8; 1];
+            storage.read(&mut sync).await?;
+            trace!("fmt: inter-FAT sync read OK");
+        }
         storage.seek(SeekFrom::Start(fat_start)).await?;
         format_fat(
             storage,
@@ -1395,13 +1409,21 @@ where
     let root_dir_sectors = bpb.root_dir_sectors();
     let root_dir_pos = bpb.bytes_from_sectors(root_dir_first_sector);
     storage.seek(SeekFrom::Start(root_dir_pos)).await?;
-    // Always zero the root directory — it's small (typically 16 KB)
-    // and 0xFF entries would need special handling in dir iteration.
-    write_zeros(storage, bpb.bytes_from_sectors(root_dir_sectors)).await?;
+    if !options.pre_erased {
+        write_zeros(storage, bpb.bytes_from_sectors(root_dir_sectors)).await?;
+    }
     if fat_type == FatType::Fat32 {
+        // erased_byte MUST match what the mount will pass. When pre_erased
+        // is set, we assume the device erases to 0xFF (modern SDHC) and the
+        // mount will use FsOptions::erased_byte(0xFF). If we passed 0 here
+        // while the mount uses 0xFF, the root-dir EOC (0x0FFFFFFF) would be
+        // indistinguishable from an erased-cluster marker and the very next
+        // alloc_cluster call at mount time would reallocate cluster 2 (the
+        // root dir), corrupting it.
+        let alloc_erased_byte = if options.pre_erased { 0xFF } else { 0x00 };
         let root_dir_first_cluster = {
             let mut fat_slice = fat_slice::<S, &mut S>(storage, bpb);
-            alloc_cluster(&mut fat_slice, fat_type, None, None, 1, 0).await?
+            alloc_cluster(&mut fat_slice, fat_type, None, None, 1, alloc_erased_byte).await?
         };
         assert!(root_dir_first_cluster == bpb.root_dir_first_cluster);
         let first_data_sector = reserved_sectors + sectors_per_all_fats + root_dir_sectors;

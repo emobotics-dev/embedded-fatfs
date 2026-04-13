@@ -539,16 +539,15 @@ where
     }
 
     async fn wait_idle(&mut self) -> Result<(), Error> {
-        // The card can hold the bus busy for 100+ ms during a
-        // write-programming cycle. Polling without `yield_now().await`
-        // starves every other async task on the same executor and, on
-        // shared-bus configurations, continuously reacquires the SPI
-        // bus mutex, blocking display/radio work entirely. Yielding
-        // once per poll lets the scheduler service other tasks between
-        // checks at the cost of one scheduler round-trip per iteration.
+        // The card holds the bus busy for 1–100+ ms during a write-
+        // programming cycle. On shared-bus configs (display + SD on
+        // same SPI), rapid polling starves the display by continuously
+        // reacquiring the SPI bus mutex. A 1 ms delay between polls
+        // gives the display task a window to complete a chunk transfer
+        // while still catching the busy→ready transition promptly.
         let outer = with_timeout(self.delay.clone(), 5000, async {
             while self.read_byte().await? != 0xFF {
-                yield_now().await;
+                self.delay.delay_ms(1).await;
             }
             Ok(())
         })
