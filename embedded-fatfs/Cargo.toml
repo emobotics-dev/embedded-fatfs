@@ -30,6 +30,16 @@ log = ["dep:log"]
 defmt = ["dep:defmt"]
 # panic when dropping dirty files, files should be flushed before hand
 dirty-file-panic = []
+# Produce cards that mount cleanly on standard FAT readers (Linux,
+# Windows, macOS, fsck.fat). When enabled, `format_volume` zero-fills
+# the FAT body even if `pre_erased` is set — an 0xFF-erased FAT body
+# is interpreted by every standard reader as "all clusters allocated
+# as end-of-chain" and would be reclaimed as lost clusters. Costs
+# ~1 MB of writes per FAT copy (~60 s on a slow SPI bus for a 30 GB
+# card). Default off — the embedded-fatfs mount tolerates the non-
+# standard layout via `erased_byte(0xFF)`, so on-device read/write
+# works fine without this.
+host-compat = []
 
 # Default features
 default = ["chrono", "lfn", "unicode", "log"]
