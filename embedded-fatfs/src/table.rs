@@ -286,17 +286,31 @@ where
 
     let zero_total = bytes_per_fat - 512;
 
-    if pre_erased {
-        // Device was erased before format — skip zero-fill entirely.
-        // Seek past the FAT body so the stream position is correct
-        // for the caller.
-        fat.seek(SeekFrom::Current(zero_total as i64)).await?;
-        trace!("fmt: fat_fill skipped (pre_erased), {} bytes", zero_total);
-        progress(zero_total, zero_total);
-    } else {
-        // Fill the rest of the FAT with zeros in 8 KiB chunks.
-        // Stream is now block-aligned → every chunk hits BufStream's
-        // fast path → single CMD25 multi-block write per chunk.
+    // Zero-fill policy:
+    // - `pre_erased` unset: always zero-fill (standard FAT format).
+    // - `pre_erased` set:
+    //     * feature `host-compat` enabled → zero-fill anyway so host
+    //       tools (fsck.fat / Linux FAT driver / Windows) mount cleanly.
+    //       Without this, the 0xFF-erased FAT body decodes to valid
+    //       `0x0FFFFFFF` EOC markers on every entry and readers see
+    //       every cluster as allocated-but-lost.
+    //     * feature `host-compat` disabled (default) → skip the zero-
+    //       fill and rely on `FsOptions::erased_byte(0xFF)` at mount
+    //       to treat 0xFF entries as free. Cards produced this way
+    //       are only fully interoperable with embedded-fatfs mounts;
+    //       host PCs will complain but file data is still readable.
+    //
+    // Data region is never zero-filled here regardless — that's what
+    // the original `pre_erased` optimisation actually saves (multi-MB
+    // to multi-GB scrub).
+    #[cfg(feature = "host-compat")]
+    let do_zero_fill = true;
+    #[cfg(not(feature = "host-compat"))]
+    let do_zero_fill = !pre_erased;
+
+    if do_zero_fill {
+        // Fill in 8 KiB chunks. Stream is block-aligned at this point
+        // → every chunk hits BufStream's fast path.
         const ZEROS_CHUNK: [u8; 8192] = [0_u8; 8192];
         let mut to_write = zero_total;
         let mut last_log = 0_u64;
@@ -314,6 +328,12 @@ where
             progress(done, zero_total);
         }
         trace!("fmt: fat_fill done {} bytes", zero_total + 512);
+    } else {
+        // pre_erased + !host-compat: skip zero-fill, seek past so the
+        // stream position is correct for the caller.
+        fat.seek(SeekFrom::Current(zero_total as i64)).await?;
+        trace!("fmt: fat_fill skipped (pre_erased), {} bytes", zero_total);
+        progress(zero_total, zero_total);
     }
     // Tail-padding entries (start_cluster..end_cluster) and
     // BAD-range markers are intentionally skipped. These entries
