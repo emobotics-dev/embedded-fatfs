@@ -1413,9 +1413,17 @@ where
         write_zeros(storage, bpb.bytes_from_sectors(root_dir_sectors)).await?;
     }
     if fat_type == FatType::Fat32 {
+        // erased_byte MUST match what the mount will pass. When pre_erased
+        // is set, we assume the device erases to 0xFF (modern SDHC) and the
+        // mount will use FsOptions::erased_byte(0xFF). If we passed 0 here
+        // while the mount uses 0xFF, the root-dir EOC (0x0FFFFFFF) would be
+        // indistinguishable from an erased-cluster marker and the very next
+        // alloc_cluster call at mount time would reallocate cluster 2 (the
+        // root dir), corrupting it.
+        let alloc_erased_byte = if options.pre_erased { 0xFF } else { 0x00 };
         let root_dir_first_cluster = {
             let mut fat_slice = fat_slice::<S, &mut S>(storage, bpb);
-            alloc_cluster(&mut fat_slice, fat_type, None, None, 1, 0).await?
+            alloc_cluster(&mut fat_slice, fat_type, None, None, 1, alloc_erased_byte).await?
         };
         assert!(root_dir_first_cluster == bpb.root_dir_first_cluster);
         let first_data_sector = reserved_sectors + sectors_per_all_fats + root_dir_sectors;
