@@ -545,11 +545,33 @@ where
         // reacquiring the SPI bus mutex. A 1 ms delay between polls
         // gives the display task a window to complete a chunk transfer
         // while still catching the busy→ready transition promptly.
+        //
+        // Robustness: poll within ONE SpiDevice transaction (CS held
+        // low across all 8 byte-reads) and require the FULL probe
+        // window to read 0xFF before declaring idle. Single-byte polls
+        // across separate transactions are unreliable on faster SPI
+        // hosts (e.g. ESP32-S3 GDMA): each new transaction's first byte
+        // can sample MISO before the card drives it, returning the
+        // pull-up's 0xFF even when the card is still busy. Holding CS
+        // low for the whole 8-byte probe lets the card drive MISO
+        // continuously and surfaces an actual busy state (any 0x00 in
+        // the window). Empirically observed on some SD cards post-
+        // CMD38: a single-byte poll on s3 mis-declares idle and the
+        // next command lands while the card is still doing post-erase
+        // housekeeping, timing out.
+        use embedded_hal_async::spi::Operation;
         let outer = with_timeout(self.delay.clone(), 5000, async {
-            while self.read_byte().await? != 0xFF {
+            loop {
+                let mut probe = [0xFFu8; 8];
+                self.spi
+                    .transaction(&mut [Operation::TransferInPlace(&mut probe)])
+                    .await
+                    .map_err(|_| Error::SpiError)?;
+                if probe.iter().all(|&b| b == 0xFF) {
+                    return Ok(());
+                }
                 self.delay.delay_ms(1).await;
             }
-            Ok(())
         })
         .await;
         if let Err(Error::Timeout) = outer {
