@@ -442,15 +442,22 @@ where
     }
 
     async fn write_data(&mut self, token: u8, buffer: &[u8]) -> Result<(), Error> {
-        // Send token + data + CRC + read data-response byte as one
-        // SpiDevice transaction. CS must stay asserted for the entire
-        // write-data phase per the SD SPI spec. Previously each part
-        // was a separate transaction and CS toggled between
-        // token/data/CRC/response, causing the card to return 0xFF
-        // (no data response) instead of the expected 0x05.
+        // Send token + data + CRC + read data-response window as one
+        // SpiDevice transaction. CS must stay asserted across the
+        // whole write-data phase per the SD SPI spec.
+        //
+        // The data-response token is supposed to arrive immediately
+        // after CRC ("with no delay" per spec) but on fast SPI hosts
+        // (cores3 GDMA observed) and during sustained multi-block
+        // writes, the card occasionally needs a few additional byte
+        // clocks before driving the response — symptom: 1-byte read
+        // returns 0xFF and the host rejects the (actually OK) write
+        // with WriteError. Mirror the cmd() fast-path: clock 8 bytes
+        // in the same transaction and scan for the first non-0xFF byte
+        // (the response token).
         let crc_bytes = crc16(buffer).to_be_bytes();
         let token_buf = [token];
-        let mut status_buf = [0xFFu8; 1];
+        let mut status_buf = [0xFFu8; 8];
         use embedded_hal_async::spi::Operation;
         self.spi
             .transaction(&mut [
@@ -462,20 +469,26 @@ where
             .await
             .map_err(|_| Error::SpiError)?;
 
-        if (status_buf[0] & DATA_RES_MASK) != DATA_RES_ACCEPTED {
-            error!(
-                "sdspi: write_data rejected, status=0x{:02x} ({})",
-                status_buf[0],
-                match status_buf[0] & DATA_RES_MASK {
-                    0x0B => "CRC error",
-                    0x0D => "write/program error",
-                    _ => "unknown",
+        for &b in &status_buf {
+            if b != 0xFF {
+                if (b & DATA_RES_MASK) != DATA_RES_ACCEPTED {
+                    error!(
+                        "sdspi: write_data rejected, status=0x{:02x} ({})",
+                        b,
+                        match b & DATA_RES_MASK {
+                            0x0B => "CRC error",
+                            0x0D => "write/program error",
+                            _ => "unknown",
+                        }
+                    );
+                    return Err(Error::WriteError);
                 }
-            );
-            return Err(Error::WriteError);
+                return Ok(());
+            }
         }
-
-        Ok(())
+        // No response in 8 bytes — card violated spec / lost sync.
+        error!("sdspi: write_data no data-response token in 8-byte window");
+        Err(Error::WriteError)
     }
 
     pub fn spi(&mut self) -> &mut SPI {
