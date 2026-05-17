@@ -375,8 +375,22 @@ where
             return Err(Error::EraseError);
         }
 
-        // CMD38 returns R1b — card holds busy until erase completes
-        self.wait_idle().await?;
+        // CMD38 returns R1b — card holds busy until erase completes.
+        // The SD spec puts no fixed upper bound on CMD38 busy time; it's a
+        // function of card size × per-AU erase time. Empirically a 7.4 GB
+        // card holds busy >60 s for a full-card erase (the duration scales
+        // roughly linearly with capacity). Use a generous erase-specific
+        // timeout so large/slow cards don't false-negative the format
+        // path; small cards still complete in well under 1 s.
+        //
+        // Cap at 60 s: longer values are pointless because sustained SD
+        // activity beyond ~60 s currently crashes fire27 firmware
+        // (open bug — see `feedback_camera_alive_check_first` /
+        // `project_fire27_layout_fragility_persists`). For cards that
+        // genuinely need >60 s, the format path will fail with Timeout
+        // and the caller can retry; bumping the budget just delays the
+        // crash with no chance of completion.
+        self.wait_idle_with_timeout_ms(60_000).await?;
 
         Ok(())
     }
@@ -539,12 +553,21 @@ where
     }
 
     async fn wait_idle(&mut self) -> Result<(), Error> {
+        self.wait_idle_with_timeout_ms(5000).await
+    }
+
+    /// Poll busy state with a caller-chosen timeout. Default `wait_idle`
+    /// uses 5 s — adequate for per-block writes. CMD38 erase on large or
+    /// slow cards can need orders of magnitude longer; the erase path
+    /// passes a generous timeout via this entry point.
+    async fn wait_idle_with_timeout_ms(&mut self, timeout_ms: u32) -> Result<(), Error> {
         // The card holds the bus busy for 1–100+ ms during a write-
-        // programming cycle. On shared-bus configs (display + SD on
-        // same SPI), rapid polling starves the display by continuously
-        // reacquiring the SPI bus mutex. A 1 ms delay between polls
-        // gives the display task a window to complete a chunk transfer
-        // while still catching the busy→ready transition promptly.
+        // programming cycle (longer for CMD38). On shared-bus configs
+        // (display + SD on same SPI), rapid polling starves the display
+        // by continuously reacquiring the SPI bus mutex. A 1 ms delay
+        // between polls gives the display task a window to complete a
+        // chunk transfer while still catching the busy→ready transition
+        // promptly.
         //
         // Robustness: poll within ONE SpiDevice transaction (CS held
         // low across all 8 byte-reads) and require the FULL probe
@@ -560,7 +583,7 @@ where
         // next command lands while the card is still doing post-erase
         // housekeeping, timing out.
         use embedded_hal_async::spi::Operation;
-        let outer = with_timeout(self.delay.clone(), 5000, async {
+        let outer = with_timeout(self.delay.clone(), timeout_ms, async {
             loop {
                 let mut probe = [0xFFu8; 8];
                 self.spi
@@ -575,7 +598,7 @@ where
         })
         .await;
         if let Err(Error::Timeout) = outer {
-            error!("sdspi: wait_idle card-busy wait timed out after 5000 ms");
+            error!("sdspi: wait_idle card-busy wait timed out after {} ms", timeout_ms);
         }
         outer?
     }
