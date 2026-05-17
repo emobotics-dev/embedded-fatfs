@@ -383,13 +383,13 @@ where
         // timeout so large/slow cards don't false-negative the format
         // path; small cards still complete in well under 1 s.
         //
-        // Cap at 60 s: longer values are pointless because sustained SD
-        // activity beyond ~60 s currently crashes fire27 firmware
-        // (open bug — see `feedback_camera_alive_check_first` /
-        // `project_fire27_layout_fragility_persists`). For cards that
-        // genuinely need >60 s, the format path will fail with Timeout
-        // and the caller can retry; bumping the budget just delays the
-        // crash with no chance of completion.
+        // 60 s sanity bound on CMD38's wait_idle — the loop itself
+        // polls MISO every ms (real readiness signal), so this is not
+        // a blind wait. A genuinely healthy card completes a full-card
+        // erase well under 30 s; if we hit 60 s the card is in a
+        // degraded state and bumping the bound just delays the
+        // failure. Investigate card state / proper readiness check
+        // via CMD13 rather than enlarging the budget.
         self.wait_idle_with_timeout_ms(60_000).await?;
 
         Ok(())
@@ -553,13 +553,17 @@ where
     }
 
     async fn wait_idle(&mut self) -> Result<(), Error> {
-        self.wait_idle_with_timeout_ms(5000).await
+        self.wait_idle_with_timeout_ms(10_000).await
     }
 
     /// Poll busy state with a caller-chosen timeout. Default `wait_idle`
-    /// uses 5 s — adequate for per-block writes. CMD38 erase on large or
-    /// slow cards can need orders of magnitude longer; the erase path
-    /// passes a generous timeout via this entry point.
+    /// uses 10 s — covers the per-block programming budget for the worst-
+    /// case write (first write into a freshly-erased AU after CMD38, where
+    /// the card relocates / wear-levels). The original 5 s default fired
+    /// on a 7.4 GB card immediately after full-card erase. CMD38 erase
+    /// itself on large or slow cards can need orders of magnitude longer
+    /// than per-block writes; the erase path passes its own 60 s timeout
+    /// via this entry point.
     async fn wait_idle_with_timeout_ms(&mut self, timeout_ms: u32) -> Result<(), Error> {
         // The card holds the bus busy for 1–100+ ms during a write-
         // programming cycle (longer for CMD38). On shared-bus configs
