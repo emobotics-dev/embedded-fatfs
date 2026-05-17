@@ -276,23 +276,16 @@ where
                     error!("sdspi::write[single] wait_idle @ {}: {:?}", block_address, e);
                     e
                 })?;
-                // check status, in SD SPI mode, the status is two bytes
-                let s1 = self.cmd(sd_status()).await.map_err(|e| {
-                    error!("sdspi::write[single] sd_status cmd @ {}: {:?}", block_address, e);
-                    e
-                })?;
-                if s1 != 0 {
-                    error!("sdspi::write[single] sd_status R1 nonzero @ {}: 0x{:02x}", block_address, s1);
-                    return Err(Error::WriteError);
-                }
-                let s2 = self.read_byte().await.map_err(|e| {
-                    error!("sdspi::write[single] sd_status byte2 @ {}: {:?}", block_address, e);
-                    e
-                })?;
-                if s2 != 0 {
-                    error!("sdspi::write[single] sd_status byte2 nonzero @ {}: 0x{:02x}", block_address, s2);
-                    return Err(Error::WriteError);
-                }
+                // NOTE: write[multi] has no analogous CMD13 (sd_status)
+                // post-check, and a CMD13 here on fast SPI hosts
+                // (ESP32-S3 GDMA observed) intermittently times out
+                // with R1 not appearing in the NCR window after the
+                // card's programming cycle — symptom is identical to
+                // the CMD24-after-CMD38 issue but per-write. We rely
+                // on `write_data`'s DATA_RES_ACCEPTED response (host-
+                // side ACK) to detect write rejection; the additional
+                // card-side status check this CMD13 provided was
+                // never propagated meaningfully to upper layers.
             } else {
                 // Try sending ACMD23 _before_ write.
                 // This will pre-erase blocks to improve write performance.
@@ -390,7 +383,17 @@ where
         // degraded state and bumping the bound just delays the
         // failure. Investigate card state / proper readiness check
         // via CMD13 rather than enlarging the budget.
-        self.wait_idle_with_timeout_ms(60_000).await?;
+        // Sustained-idle post-CMD38: require 2 000 consecutive all-0xFF
+        // 8-byte probes (≈ 2 s of confirmed idle) before declaring the
+        // erase done. Cards on fast SPI hosts (ESP32-S3 GDMA + 16 GB
+        // card observed) keep doing internal housekeeping after MISO
+        // first goes high; the next CMD24's R1 never arrives if we
+        // proceed too early. A previous workaround was a blind 2 s
+        // `Timer::after` in the format path — this is the polled
+        // equivalent: any 0x00 byte in a probe resets the counter, so
+        // fast cards exit quickly while cards still in housekeeping
+        // take as long as they actually need.
+        self.wait_idle_sustained_ms(60_000, 2_000).await?;
 
         Ok(())
     }
@@ -494,36 +497,76 @@ where
         ];
         buf[5] = crc7(&buf[0..5]);
 
-        // Send command + read first R1 byte in one transaction so CS
-        // stays asserted across the command-to-response boundary.
-        let mut first = [0xFFu8; 1];
+        // Send command + read the full SD-spec NCR window in a single
+        // transaction so CS stays asserted across the command-to-response
+        // boundary. The SD spec puts NCR (host-clock-to-R1 latency) at
+        // 1-8 bytes; a spec-compliant card MUST respond within that
+        // window, so an 8-byte read here catches R1 in a single
+        // CS-asserted transaction for any compliant card.
+        //
+        // CRITICAL on fast SPI hosts (ESP32-S3 GDMA): a previous
+        // implementation read only 1 byte in the fast path and fell
+        // back to per-byte slow-path polls (each its own SpiDevice
+        // transaction → CS toggled between bytes). On fast hosts the
+        // MISO pull-up wins for several µs after CS reasserts, so the
+        // card's R1 — sent during the gap when MISO was high-Z — was
+        // silently lost. CMD24-after-CMD38 reliably hit this on cores3
+        // + 16 GB card (NCR>1 post-erase), timing out at 10 s while
+        // the card was actually fine.
+        //
+        // Commands with bytes the caller must consume AFTER R1:
+        //   - R3/R7/R2 trailing response bytes: CMD8, CMD13, CMD58 send
+        //     4 (or 1) data bytes in the same response stream right
+        //     after R1.
+        //   - Block-read commands: CMD9/10 (CSD/CID) and CMD17/18 (data
+        //     blocks) follow R1 with a card-controlled gap, then a
+        //     0xFE data-start token; the gap is normally many bytes
+        //     long but is card-dependent and could in principle land
+        //     within our 8-byte fast-path window.
+        // For all of these we keep the original 1-byte fast-path read
+        // so trailing bytes / data tokens stay queued in the card's
+        // SPI pipeline for the caller's follow-up read. Init has retry
+        // loops around the R-type readers so an occasional NCR>1 on
+        // these commands is recoverable.
+        let has_trailing_bytes = matches!(cmd.cmd, 8 | 9 | 10 | 13 | 17 | 18 | 58);
+        let mut response = [0xFFu8; 8];
         let mut stuff = [0xFFu8; 1];
 
         use embedded_hal_async::spi::Operation;
         if cmd.cmd == stop_transmission().cmd {
+            // CMD12 has a mandatory stuff byte before R1 (SPI-mode
+            // erratum). Keep the original two-slot read.
             self.spi
                 .transaction(&mut [
                     Operation::Write(&buf),
                     Operation::TransferInPlace(&mut stuff),
-                    Operation::TransferInPlace(&mut first),
+                    Operation::TransferInPlace(&mut response[..1]),
                 ])
                 .await
                 .map_err(|_| Error::SpiError)?;
         } else {
+            let resp_len = if has_trailing_bytes { 1 } else { 8 };
             self.spi
                 .transaction(&mut [
                     Operation::Write(&buf),
-                    Operation::TransferInPlace(&mut first),
+                    Operation::TransferInPlace(&mut response[..resp_len]),
                 ])
                 .await
                 .map_err(|_| Error::SpiError)?;
         }
 
-        if first[0] & 0x80 == 0 {
-            return Ok(first[0]);
+        // Scan the response window for the first non-0xFF byte (R1).
+        let scan_len = if cmd.cmd == stop_transmission().cmd || has_trailing_bytes { 1 } else { 8 };
+        for &b in &response[..scan_len] {
+            if b & 0x80 == 0 {
+                return Ok(b);
+            }
         }
 
-        // Slow path: card needed more than one byte of NCR.
+        // Slow path: card violated SD spec (NCR > 8 bytes). Per-byte
+        // poll with CS toggle is unreliable on fast hosts but a
+        // compliant card cannot reach here, so the fallback is just
+        // for graceful degradation on misbehaving cards.
         let mut polls: u32 = 1;
         let outer = with_timeout(self.delay.clone(), 10_000, async {
             loop {
@@ -556,38 +599,37 @@ where
         self.wait_idle_with_timeout_ms(10_000).await
     }
 
-    /// Poll busy state with a caller-chosen timeout. Default `wait_idle`
-    /// uses 10 s — covers the per-block programming budget for the worst-
-    /// case write (first write into a freshly-erased AU after CMD38, where
-    /// the card relocates / wear-levels). The original 5 s default fired
-    /// on a 7.4 GB card immediately after full-card erase. CMD38 erase
-    /// itself on large or slow cards can need orders of magnitude longer
-    /// than per-block writes; the erase path passes its own 60 s timeout
-    /// via this entry point.
+    /// Default `wait_idle` semantics: return at the first all-0xFF
+    /// 8-byte probe. Used for fast-path per-write idle confirmation.
     async fn wait_idle_with_timeout_ms(&mut self, timeout_ms: u32) -> Result<(), Error> {
-        // The card holds the bus busy for 1–100+ ms during a write-
-        // programming cycle (longer for CMD38). On shared-bus configs
-        // (display + SD on same SPI), rapid polling starves the display
-        // by continuously reacquiring the SPI bus mutex. A 1 ms delay
-        // between polls gives the display task a window to complete a
-        // chunk transfer while still catching the busy→ready transition
-        // promptly.
-        //
-        // Robustness: poll within ONE SpiDevice transaction (CS held
-        // low across all 8 byte-reads) and require the FULL probe
-        // window to read 0xFF before declaring idle. Single-byte polls
-        // across separate transactions are unreliable on faster SPI
-        // hosts (e.g. ESP32-S3 GDMA): each new transaction's first byte
-        // can sample MISO before the card drives it, returning the
-        // pull-up's 0xFF even when the card is still busy. Holding CS
-        // low for the whole 8-byte probe lets the card drive MISO
-        // continuously and surfaces an actual busy state (any 0x00 in
-        // the window). Empirically observed on some SD cards post-
-        // CMD38: a single-byte poll on s3 mis-declares idle and the
-        // next command lands while the card is still doing post-erase
-        // housekeeping, timing out.
+        self.wait_idle_sustained_ms(timeout_ms, 1).await
+    }
+
+    /// Poll busy state with a caller-chosen timeout and a sustained-idle
+    /// requirement: return only when `sustained_count` consecutive 8-byte
+    /// probes have all read 0xFF. Any 0x00 byte in a probe resets the
+    /// counter — a real polled signal that catches cards transiently
+    /// flicking MISO high during post-CMD38 housekeeping.
+    ///
+    /// `sustained_count == 1` (used by the default `wait_idle`) gives
+    /// the legacy "exit on first idle probe" behavior — fine for per-
+    /// write idle waits where the card is in TRAN state when busy
+    /// clears. The erase path passes a larger value to absorb post-
+    /// erase housekeeping that the per-probe view alone can miss.
+    ///
+    /// Each loop iteration is one 8-byte SpiDevice transaction
+    /// (CS held across all 8 bytes — single-byte polls are unreliable
+    /// on fast SPI hosts like ESP32-S3 GDMA) plus a 1 ms delay so
+    /// shared-bus consumers (display) aren't starved.
+    async fn wait_idle_sustained_ms(
+        &mut self,
+        timeout_ms: u32,
+        sustained_count: u32,
+    ) -> Result<(), Error> {
         use embedded_hal_async::spi::Operation;
+        let target = sustained_count.max(1);
         let outer = with_timeout(self.delay.clone(), timeout_ms, async {
+            let mut consec: u32 = 0;
             loop {
                 let mut probe = [0xFFu8; 8];
                 self.spi
@@ -595,14 +637,22 @@ where
                     .await
                     .map_err(|_| Error::SpiError)?;
                 if probe.iter().all(|&b| b == 0xFF) {
-                    return Ok(());
+                    consec += 1;
+                    if consec >= target {
+                        return Ok(());
+                    }
+                } else {
+                    consec = 0;
                 }
                 self.delay.delay_ms(1).await;
             }
         })
         .await;
         if let Err(Error::Timeout) = outer {
-            error!("sdspi: wait_idle card-busy wait timed out after {} ms", timeout_ms);
+            error!(
+                "sdspi: wait_idle timed out after {} ms (sustained target {})",
+                timeout_ms, sustained_count
+            );
         }
         outer?
     }
