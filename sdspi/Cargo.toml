@@ -19,3 +19,11 @@ defmt = { version = "0.3", optional = true }
 log = ["dep:log"]
 # enable defmt support
 defmt = ["dep:defmt"]
+# Insert a sustained-idle wait (200 ms of confirmed all-0xFF MISO) after
+# CMD38 erase, before the next command. Required on ESP32-S3 + 16 GB
+# SDHC where a brief false-idle leads to the next CMD24 timing out.
+# Costs ~200 ms per format AND holds the SPI bus mutex repeatedly during
+# that window, which can starve other interrupt sources on hosts that
+# can't tolerate it (e.g. fire27 / ESP32 PDMA where it kills the BLE
+# radio blob). Default OFF.
+post-erase-sustained-idle = []
