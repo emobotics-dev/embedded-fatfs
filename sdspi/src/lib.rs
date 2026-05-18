@@ -369,30 +369,40 @@ where
         }
 
         // CMD38 returns R1b — card holds busy until erase completes.
-        // The SD spec puts no fixed upper bound on CMD38 busy time; it's a
-        // function of card size × per-AU erase time. Empirically a 7.4 GB
-        // card holds busy >60 s for a full-card erase (the duration scales
-        // roughly linearly with capacity). Use a generous erase-specific
-        // timeout so large/slow cards don't false-negative the format
-        // path; small cards still complete in well under 1 s.
+        // 60 s sanity bound is large because the SD spec puts no fixed
+        // upper bound on full-card CMD38 (function of capacity × per-AU
+        // erase time).
+        self.wait_idle_with_timeout_ms(60_000).await?;
+
+        // Post-CMD38 sustained-idle. Some host/card combinations show a
+        // brief false-idle right after CMD38 (MISO goes 0xFF transiently
+        // while the card is still doing post-erase housekeeping). Without
+        // a sustained check, the next CMD24 lands on a busy card whose
+        // R1 never arrives, and the format times out.
         //
-        // 60 s sanity bound on CMD38's wait_idle — the loop itself
-        // polls MISO every ms (real readiness signal), so this is not
-        // a blind wait. A genuinely healthy card completes a full-card
-        // erase well under 30 s; if we hit 60 s the card is in a
-        // degraded state and bumping the bound just delays the
-        // failure. Investigate card state / proper readiness check
-        // via CMD13 rather than enlarging the budget.
-        // Sustained-idle post-CMD38: require 2 000 consecutive all-0xFF
-        // 8-byte probes (≈ 2 s of confirmed idle) before declaring the
-        // erase done. Cards on fast SPI hosts (ESP32-S3 GDMA + 16 GB
-        // card observed) keep doing internal housekeeping after MISO
-        // first goes high; the next CMD24's R1 never arrives if we
-        // proceed too early. A previous workaround was a blind 2 s
-        // `Timer::after` in the format path — this is the polled
-        // equivalent: any 0x00 byte in a probe resets the counter, so
-        // fast cards exit quickly while cards still in housekeeping
-        // take as long as they actually need.
+        // FEATURE GATING: the cores3 + 16 GB SDHC card (ESP32-S3 GDMA)
+        // *requires* this guard — 0/10 format failure without it. fire27
+        // (ESP32 PDMA + shared-bus display + BLE controller) cannot
+        // tolerate the cumulative SPI-bus-mutex hold across thousands
+        // of probe transactions: the level-1 RWBLE interrupt gets
+        // masked for ms-scale windows, the BLE controller blob de-syncs,
+        // and the embassy executor eventually stops polling tasks
+        // (visible as LVGL FPS dropping to zero mid-format and the
+        // chip becoming unresponsive to all serial input). fire27's
+        // 8-byte NCR fast-path in `cmd()` is sufficient on its own.
+        //
+        // Targets opt in by enabling the `post-erase-sustained-idle`
+        // feature on the sdspi dependency. fire27 leaves it off; cores3
+        // enables it.
+        //
+        // sustained_count = 2 000 (≈ 2 s of confirmed continuous idle):
+        // empirically required for cores3 + 8 GB SDHC card combo
+        // (200 ms is insufficient — sustained exits OK but the next
+        // CMD24 still finds the card busy at the protocol level and
+        // times out at 10 s). Conservative; small fast cards exit
+        // promptly because any 0x00 byte in a probe resets the counter
+        // and they reach 2 s of idle quickly.
+        #[cfg(feature = "post-erase-sustained-idle")]
         self.wait_idle_sustained_ms(60_000, 2_000).await?;
 
         Ok(())
@@ -633,7 +643,7 @@ where
     /// Each loop iteration is one 8-byte SpiDevice transaction
     /// (CS held across all 8 bytes — single-byte polls are unreliable
     /// on fast SPI hosts like ESP32-S3 GDMA) plus a 1 ms delay so
-    /// shared-bus consumers (display) aren't starved.
+    /// shared-bus consumers (display flush) aren't starved.
     async fn wait_idle_sustained_ms(
         &mut self,
         timeout_ms: u32,
