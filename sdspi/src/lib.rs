@@ -651,6 +651,12 @@ where
     ) -> Result<(), Error> {
         use embedded_hal_async::spi::Operation;
         let target = sustained_count.max(1);
+        // Atomic counter so we can tell on timeout whether polling ran
+        // normally (≈ timeout_ms polls — card stayed busy) or was starved
+        // (only a handful of polls — SPI bus mutex held by another path).
+        use core::sync::atomic::{AtomicU32, Ordering};
+        static POLLS: AtomicU32 = AtomicU32::new(0);
+        let start_polls = POLLS.load(Ordering::Relaxed);
         let outer = with_timeout(self.delay.clone(), timeout_ms, async {
             let mut consec: u32 = 0;
             loop {
@@ -659,6 +665,7 @@ where
                     .transaction(&mut [Operation::TransferInPlace(&mut probe)])
                     .await
                     .map_err(|_| Error::SpiError)?;
+                POLLS.fetch_add(1, Ordering::Relaxed);
                 if probe.iter().all(|&b| b == 0xFF) {
                     consec += 1;
                     if consec >= target {
@@ -672,9 +679,10 @@ where
         })
         .await;
         if let Err(Error::Timeout) = outer {
+            let polls = POLLS.load(Ordering::Relaxed).wrapping_sub(start_polls);
             error!(
-                "sdspi: wait_idle timed out after {} ms (sustained target {})",
-                timeout_ms, sustained_count
+                "sdspi: wait_idle timed out after {} ms (sustained target {}) polls_in_window={}",
+                timeout_ms, sustained_count, polls
             );
         }
         outer?
