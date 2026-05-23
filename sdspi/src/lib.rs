@@ -467,19 +467,25 @@ where
         // (the response token).
         let crc_bytes = crc16(buffer).to_be_bytes();
         let token_buf = [token];
-        let mut status_buf = [0xFFu8; 8];
+        // Word-aligned: ESP32 PDMA needs 4-byte aligned DMA buffers;
+        // a bare `[u8; 8]` on stack is alignment 1. See wait_idle probe
+        // comment for the failure mode. `[u32; 2]` forces 4-aligned.
+        let mut status_word = [0xFFFFFFFFu32; 2];
+        let status_buf: &mut [u8; 8] = unsafe {
+            &mut *(status_word.as_mut_ptr() as *mut [u8; 8])
+        };
         use embedded_hal_async::spi::Operation;
         self.spi
             .transaction(&mut [
                 Operation::Write(&token_buf),
                 Operation::Write(buffer),
                 Operation::Write(&crc_bytes),
-                Operation::TransferInPlace(&mut status_buf),
+                Operation::TransferInPlace(status_buf),
             ])
             .await
             .map_err(|_| Error::SpiError)?;
 
-        for &b in &status_buf {
+        for &b in &*status_buf {
             if b != 0xFF {
                 if (b & DATA_RES_MASK) != DATA_RES_ACCEPTED {
                     error!(
@@ -552,7 +558,13 @@ where
         // loops around the R-type readers so an occasional NCR>1 on
         // these commands is recoverable.
         let has_trailing_bytes = matches!(cmd.cmd, 8 | 9 | 10 | 13 | 17 | 18 | 58);
-        let mut response = [0xFFu8; 8];
+        // Word-aligned 8-byte response. See wait_idle probe comment for the
+        // ESP32 PDMA alignment hazard. `stuff` is only one byte so DMA
+        // alignment is moot (1-byte transfers don't need word alignment).
+        let mut response_word = [0xFFFFFFFFu32; 2];
+        let response: &mut [u8; 8] = unsafe {
+            &mut *(response_word.as_mut_ptr() as *mut [u8; 8])
+        };
         let mut stuff = [0xFFu8; 1];
 
         use embedded_hal_async::spi::Operation;
