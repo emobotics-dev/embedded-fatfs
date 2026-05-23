@@ -657,12 +657,27 @@ where
         use core::sync::atomic::{AtomicU32, Ordering};
         static POLLS: AtomicU32 = AtomicU32::new(0);
         let start_polls = POLLS.load(Ordering::Relaxed);
+        // Word-aligned backing storage. ESP32 PDMA REQUIRES the DMA
+        // source/dest address to be 4-byte aligned; a bare `[u8; 8]` on
+        // stack has alignment 1 and can land at any byte address, and
+        // when it lands non-aligned the PDMA TransferDone IRQ never
+        // fires (TransferInPlace = duplex, both TX and RX paths must be
+        // aligned). Without explicit alignment the outcome is layout-
+        // sensitive: a single info!() elsewhere shifts this stack frame
+        // and can flip a working format path into an indefinite spin
+        // inside the bus driver, which then never yields and traps the
+        // executor itself (no timeout fires, no log appears). Use
+        // [u32; 2] backing and cast on each probe.
         let outer = with_timeout(self.delay.clone(), timeout_ms, async {
             let mut consec: u32 = 0;
+            let mut probe_word: [u32; 2];
             loop {
-                let mut probe = [0xFFu8; 8];
+                probe_word = [0xFFFFFFFFu32; 2];
+                let probe: &mut [u8; 8] = unsafe {
+                    &mut *(probe_word.as_mut_ptr() as *mut [u8; 8])
+                };
                 self.spi
-                    .transaction(&mut [Operation::TransferInPlace(&mut probe)])
+                    .transaction(&mut [Operation::TransferInPlace(probe)])
                     .await
                     .map_err(|_| Error::SpiError)?;
                 POLLS.fetch_add(1, Ordering::Relaxed);
