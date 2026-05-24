@@ -6,43 +6,55 @@
 
 use aligned::Aligned;
 
+/// The buffer-alignment invariant for all `BlockDevice` implementations in
+/// this fork: 4 bytes (word). ESP32 PDMA requires word-aligned source/dest
+/// addresses for SPI DMA; ARM Cortex-M and RISC-V DMA engines that do
+/// word-burst transfers have the same requirement. Host simulators that
+/// don't care about alignment receive over-aligned buffers — harmless.
+///
+/// Upstream `block-device-driver` exposes this as `BlockDevice::Align` for
+/// per-impl customisation. We hard-code it instead: in practice everyone
+/// wants ≥A4, and the per-impl escape hatch was a footgun (host test
+/// helpers were silently A1, leading to UB when those types were fed into
+/// DMA-bound consumers via generics).
+pub type DmaAlign = aligned::A4;
+
+/// A DMA-safe block buffer: `Aligned<DmaAlign, [u8; SIZE]>`.
+///
+/// Use this as the element type in `[DmaBlock<SIZE>; N]` arrays passed to
+/// `BlockDevice::read`/`write`. See [`DmaAlign`] for why A4.
+pub type DmaBlock<const SIZE: usize> = Aligned<DmaAlign, [u8; SIZE]>;
+
 /// A trait for a block devices
 ///
-/// [`BlockDevice<const SIZE: usize>`](BlockDevice) can be initialized with the following parameters.
+/// [`BlockDevice<const SIZE: usize>`](BlockDevice) is parameterised on:
 ///
-/// - `const SIZE`: The size of the block in the block device.
-/// - `type Align`: The [`aligned::Alignment`] of the block buffers for this implementation.
+/// - `const SIZE`: The size of the block in the block device, in bytes.
 /// - `type Error`: The error type for the implementation.
 ///
-/// The generic parameter `SIZE` on [BlockDevice] is the number of _bytes_ in a block
-/// for this block device.
+/// All block buffers are `[DmaBlock<SIZE>]` — see [`DmaAlign`] for the
+/// fork's alignment rationale.
 ///
 /// All addresses are zero indexed, and the unit is blocks. For example to read bytes
 /// from 1024 to 1536 on a 512 byte block device, the supplied block address would be 2.
-///
-/// <div class="warning"><b>NOTE to implementors</b>: Alignment of the buffer <b>must</b> be multiple of SIZE to avoid
-/// padding bytes when casting between blocks and slices.</div>
 ///
 /// This trait can be implemented multiple times to support various different block sizes.
 pub trait BlockDevice<const SIZE: usize> {
     /// The error type for the BlockDevice implementation.
     type Error: core::fmt::Debug;
 
-    /// The alignment requirements of the block buffers.
-    type Align: aligned::Alignment;
-
     /// Read one or more blocks at the given block address.
     async fn read(
         &mut self,
         block_address: u32,
-        data: &mut [Aligned<Self::Align, [u8; SIZE]>],
+        data: &mut [DmaBlock<SIZE>],
     ) -> Result<(), Self::Error>;
 
     /// Write one or more blocks at the given block address.
     async fn write(
         &mut self,
         block_address: u32,
-        data: &[Aligned<Self::Align, [u8; SIZE]>],
+        data: &[DmaBlock<SIZE>],
     ) -> Result<(), Self::Error>;
 
     /// Report the size of the block device in bytes.
@@ -51,12 +63,11 @@ pub trait BlockDevice<const SIZE: usize> {
 
 impl<T: BlockDevice<SIZE>, const SIZE: usize> BlockDevice<SIZE> for &mut T {
     type Error = T::Error;
-    type Align = T::Align;
 
     async fn read(
         &mut self,
         block_address: u32,
-        data: &mut [Aligned<Self::Align, [u8; SIZE]>],
+        data: &mut [DmaBlock<SIZE>],
     ) -> Result<(), Self::Error> {
         (*self).read(block_address, data).await
     }
@@ -64,7 +75,7 @@ impl<T: BlockDevice<SIZE>, const SIZE: usize> BlockDevice<SIZE> for &mut T {
     async fn write(
         &mut self,
         block_address: u32,
-        data: &[Aligned<Self::Align, [u8; SIZE]>],
+        data: &[DmaBlock<SIZE>],
     ) -> Result<(), Self::Error> {
         (*self).write(block_address, data).await
     }

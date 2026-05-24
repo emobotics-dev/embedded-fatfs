@@ -51,7 +51,7 @@ impl<T: core::fmt::Debug> embedded_io_async::Error for BufStreamError<T> {
 pub struct BufStream<T: BlockDevice<SIZE>, const SIZE: usize> {
     inner: T,
     // Primary cache slot. `read`/`write` always operate on this slot.
-    buffer: Aligned<T::Align, [u8; SIZE]>,
+    buffer: block_device_driver::DmaBlock<SIZE>,
     current_block: u32,
     dirty: bool,
     // Shadow cache slot. Holds the "other" recently-touched block so
@@ -62,14 +62,14 @@ pub struct BufStream<T: BlockDevice<SIZE>, const SIZE: usize> {
     // because every tiny FAT-entry write forced a full read-modify-
     // write cycle for both FAT mirrors, hitting the same two sectors
     // hundreds of times in a few seconds.
-    shadow_buffer: Aligned<T::Align, [u8; SIZE]>,
+    shadow_buffer: block_device_driver::DmaBlock<SIZE>,
     shadow_block: u32,
     shadow_dirty: bool,
     current_offset: u64,
 }
 
 impl<T: BlockDevice<SIZE>, const SIZE: usize> BufStream<T, SIZE> {
-    const ALIGN: usize = core::mem::align_of::<Aligned<T::Align, [u8; SIZE]>>();
+    const ALIGN: usize = core::mem::align_of::<block_device_driver::DmaBlock<SIZE>>();
     /// Create a new [`BufStream`] around a hardware block device.
     pub fn new(inner: T) -> Self {
         Self {
@@ -351,13 +351,12 @@ mod tests {
 
     impl<T: Read + Write + Seek> BlockDevice<512> for TestBlockDevice<T> {
         type Error = T::Error;
-        type Align = aligned::A4;
 
         /// Read one or more blocks at the given block address.
         async fn read(
             &mut self,
             block_address: u32,
-            data: &mut [Aligned<Self::Align, [u8; 512]>],
+            data: &mut [block_device_driver::DmaBlock<512>],
         ) -> Result<(), Self::Error> {
             self.0
                 .seek(SeekFrom::Start((block_address * 512).into()))
@@ -372,7 +371,7 @@ mod tests {
         async fn write(
             &mut self,
             block_address: u32,
-            data: &[Aligned<Self::Align, [u8; 512]>],
+            data: &[block_device_driver::DmaBlock<512>],
         ) -> Result<(), Self::Error> {
             self.0
                 .seek(SeekFrom::Start((block_address * 512).into()))
