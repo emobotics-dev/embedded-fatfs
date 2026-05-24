@@ -2,10 +2,9 @@
 
 #![no_std]
 
-use aligned::Aligned;
+use block_device_driver::DmaBlock;
 use core::fmt::Debug;
 use core::future::Future;
-use core::marker::PhantomData;
 use embassy_futures::select::{select, Either};
 use embassy_futures::yield_now;
 use sdio_host::sd::{CardCapacity, CID, CSD, OCR, SD};
@@ -86,30 +85,26 @@ where
     Ok(())
 }
 
-pub struct SdSpi<SPI, D, ALIGN>
+pub struct SdSpi<SPI, D>
 where
     SPI: embedded_hal_async::spi::SpiDevice,
     D: embedded_hal_async::delay::DelayNs,
-    ALIGN: aligned::Alignment,
 {
     spi: SPI,
     delay: D,
     card: Option<Card>,
-    _align: PhantomData<ALIGN>,
 }
 
-impl<SPI, D, ALIGN> SdSpi<SPI, D, ALIGN>
+impl<SPI, D> SdSpi<SPI, D>
 where
     SPI: embedded_hal_async::spi::SpiDevice,
     D: embedded_hal_async::delay::DelayNs + Clone,
-    ALIGN: aligned::Alignment,
 {
     pub fn new(spi: SPI, delay: D) -> Self {
         Self {
             spi,
             delay,
             card: None,
-            _align: PhantomData,
         }
     }
 
@@ -218,7 +213,7 @@ where
     pub async fn read<const SIZE: usize>(
         &mut self,
         block_address: u32,
-        data: &mut [Aligned<ALIGN, [u8; SIZE]>],
+        data: &mut [DmaBlock<SIZE>],
     ) -> Result<(), Error> {
         let n = data.len();
         let r = async {
@@ -259,7 +254,7 @@ where
     pub async fn write<const SIZE: usize>(
         &mut self,
         block_address: u32,
-        data: &[Aligned<ALIGN, [u8; SIZE]>],
+        data: &[DmaBlock<SIZE>],
     ) -> Result<(), Error> {
         let n = data.len();
         let r = async {
@@ -726,20 +721,18 @@ where
     }
 }
 
-impl<SPI, D, ALIGN, const SIZE: usize> block_device_driver::BlockDevice<SIZE>
-    for SdSpi<SPI, D, ALIGN>
+impl<SPI, D, const SIZE: usize> block_device_driver::BlockDevice<SIZE>
+    for SdSpi<SPI, D>
 where
     SPI: embedded_hal_async::spi::SpiDevice,
     D: embedded_hal_async::delay::DelayNs + Clone,
-    ALIGN: aligned::Alignment,
 {
     type Error = Error;
-    type Align = ALIGN;
 
     async fn read(
         &mut self,
         block_address: u32,
-        data: &mut [Aligned<ALIGN, [u8; SIZE]>],
+        data: &mut [DmaBlock<SIZE>],
     ) -> Result<(), Self::Error> {
         self.read(block_address, data).await
     }
@@ -747,7 +740,7 @@ where
     async fn write(
         &mut self,
         block_address: u32,
-        data: &[Aligned<ALIGN, [u8; SIZE]>],
+        data: &[DmaBlock<SIZE>],
     ) -> Result<(), Self::Error> {
         self.write(block_address, data).await
     }
@@ -757,11 +750,10 @@ where
     }
 }
 
-impl<SPI, D, ALIGN> block_device_driver::Erase for SdSpi<SPI, D, ALIGN>
+impl<SPI, D> block_device_driver::Erase for SdSpi<SPI, D>
 where
     SPI: embedded_hal_async::spi::SpiDevice,
     D: embedded_hal_async::delay::DelayNs + Clone,
-    ALIGN: aligned::Alignment,
 {
     type Error = Error;
 
