@@ -661,6 +661,14 @@ where
         // Atomic counter so we can tell on timeout whether polling ran
         // normally (≈ timeout_ms polls — card stayed busy) or was starved
         // (only a handful of polls — SPI bus mutex held by another path).
+        // The AtomicU32 is ALSO load-bearing for reliability beyond the
+        // diagnostic: removing it (replacing with local u32) on top of the
+        // [u32; 2] alignment fix re-triggers the silent fire27 wedge after
+        // `sd: erasing N blocks` (HIL 2026-05-26 — see docs/spi-dma-and-
+        // wakeup.md §7). LLVM lowers Relaxed fetch_add on Xtensa LX6 to
+        // `s32c1i`, whose AHB bus arbitration / write-buffer flush has
+        // hardware side effects that are not promised by Rust's Relaxed
+        // ordering but are empirically required here. Do not remove.
         use core::sync::atomic::{AtomicU32, Ordering};
         static POLLS: AtomicU32 = AtomicU32::new(0);
         let start_polls = POLLS.load(Ordering::Relaxed);
