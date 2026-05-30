@@ -117,6 +117,19 @@ where
                     if r == R1_IDLE_STATE {
                         return Ok(());
                     }
+                    // PARK between polls — do NOT spin, and do NOT use
+                    // `yield_now` here. On fire27 this runs on the PRO-core
+                    // level-1 InterruptExecutor; a self-wake (spin or
+                    // yield_now) just re-pends the level-1 SWI, which re-fires
+                    // immediately on handler return and never lets the level-0
+                    // thread-mode executor run. That executor hosts the BLE
+                    // controller blob's scheduler — starve it and the blob
+                    // desyncs and the whole PRO executor wedges (HIL: 100% boot
+                    // freeze with no card, where this CMD0 loop spins the full
+                    // 1 s timeout 5× via the caller's retry loop). A real timer
+                    // park idles the interrupt-exec so level-0 (and the blob)
+                    // gets to run.
+                    self.delay.delay_ms(1).await;
                 }
             })
             .await??;
@@ -141,6 +154,7 @@ where
                     if buffer[3] == 0xAA {
                         return Ok(());
                     }
+                    self.delay.delay_ms(1).await; // park — see CMD0 loop above
                 }
             })
             .await??;
@@ -157,6 +171,9 @@ where
                     if r == R1_READY_STATE {
                         return Ok(());
                     }
+                    // park — ACMD41 loops many times on a slow card mid-init;
+                    // a bare spin here also starves the level-0 blob (see CMD0).
+                    self.delay.delay_ms(1).await;
                 }
             })
             .await??;
@@ -177,6 +194,7 @@ where
                     if !ocr.is_busy() {
                         return Ok(ocr);
                     }
+                    self.delay.delay_ms(1).await; // park — see CMD0 loop above
                 }
             })
             .await??;
@@ -605,6 +623,17 @@ where
                 if byte & 0x80 == 0 {
                     return Ok(byte);
                 }
+                // PARK between polls — THIS is the no-card hog. A missing card
+                // never sends R1, so every CMD0 falls through the 8-byte scan
+                // into this loop and spins it the full timeout. On fire27 cmd()
+                // runs on the PRO-core level-1 InterruptExecutor; a bare spin of
+                // single-byte transfers here pins level-1 and starves the
+                // level-0 thread-mode BLE blob (HIL 2026-05-30: BLE init dragged
+                // 2.8s→5.5s, then wedge). The outer init retry loops never reach
+                // their own park because cmd() never returns on a missing card —
+                // it lives here until the caller's with_timeout cancels it. A
+                // real timer park idles the interrupt-exec so level-0 runs.
+                self.delay.delay_ms(1).await;
             }
         })
         .await;
