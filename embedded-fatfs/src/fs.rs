@@ -414,10 +414,19 @@ impl<IO: ReadWriteSeek, TP, OCC> FileSystem<IO, TP, OCC> {
         let total_clusters = bpb.total_clusters();
         let fat_type = FatType::from_clusters(total_clusters);
 
-        assert!(
-            options.erased_byte == 0x00 || fat_type == FatType::Fat32,
-            "erased_byte(0xFF) only supported on FAT32 volumes"
-        );
+        // An incompatible mount option must NOT panic: a removable card the
+        // host doesn't understand has to degrade gracefully, never crash the
+        // device. `erased_byte(0xFF)` is the FAT32 pre-erased fast-path (treat
+        // 0xFFFF_FFFF FAT entries as free); on FAT12/16 those are valid in-use
+        // entries, so the combination is unsupported. Reject it as a recoverable
+        // error and let the caller warn + fall back, instead of `assert!`.
+        if options.erased_byte != 0x00 && fat_type != FatType::Fat32 {
+            error!(
+                "erased_byte(0x{:02X}) is only supported on FAT32 volumes; this volume is {:?} — refusing to mount",
+                options.erased_byte, fat_type
+            );
+            return Err(Error::InvalidInput);
+        }
 
         // read FSInfo sector if this is FAT32
         let mut fs_info = if fat_type == FatType::Fat32 {

@@ -171,6 +171,34 @@ async fn test_format_volume_label_and_id() {
     assert_eq!(fs.volume_id(), 1234);
 }
 
+#[tokio::test]
+async fn fat16_with_erased_byte_0xff_returns_err_not_panic() {
+    // Regression guard: mounting a non-FAT32 volume with `erased_byte(0xFF)` —
+    // the FAT32 pre-erased fast-path option — must return `Err`, NOT
+    // `assert!`-panic. A removable card the host doesn't understand has to
+    // degrade gracefully (the alternator-regulator firmware warns and runs like
+    // no card); pre-fix this `assert!` panicked → on-target RWDT. See
+    // docs/plans/2026-05-31-incompatible-card-graceful-degrade.md.
+    let _ = env_logger::builder().is_test(true).try_init();
+    // 8 MB + a single FAT formats as FAT16 (cf. test_format_8mb_1fat).
+    let total_bytes = 8 * MB;
+    let storage_vec: Vec<u8> = vec![0xD1_u8; total_bytes as usize];
+    let storage_cur = io::Cursor::new(storage_vec);
+    let mut buffered_stream =
+        embedded_io_adapters::tokio_1::FromTokio::new(tokio::io::BufStream::new(storage_cur));
+    embedded_fatfs::format_volume(&mut buffered_stream, embedded_fatfs::FormatVolumeOptions::new().fats(1))
+        .await
+        .expect("format FAT16 volume");
+
+    // Re-open the FAT16 volume with the FAT32-only `erased_byte(0xFF)` option.
+    let res = embedded_fatfs::FileSystem::new(buffered_stream, embedded_fatfs::FsOptions::new().erased_byte(0xFF)).await;
+    match res {
+        Err(embedded_fatfs::Error::InvalidInput) => { /* expected: graceful rejection, no panic */ }
+        Err(e) => panic!("expected Error::InvalidInput, got {e:?}"),
+        Ok(_) => panic!("erased_byte(0xFF) on a FAT16 volume must be rejected, but mount succeeded"),
+    }
+}
+
 async fn read_to_end<IO: embedded_io_async::Read>(io: &mut IO) -> Result<Vec<u8>, IO::Error> {
     let mut buf = Vec::new();
     loop {
