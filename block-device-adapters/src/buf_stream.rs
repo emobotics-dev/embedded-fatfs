@@ -1,3 +1,7 @@
+// Only the test mod constructs `Aligned` directly now (the live struct borrows
+// caller-provided `&'static mut DmaBlock` slots); gate to avoid an unused-import
+// warning in firmware builds.
+#[cfg(test)]
 use aligned::Aligned;
 use block_device_driver::{slice_to_blocks, slice_to_blocks_mut, BlockDevice};
 use embedded_io_async::{ErrorKind, Read, Seek, SeekFrom, Write};
@@ -51,7 +55,13 @@ impl<T: core::fmt::Debug> embedded_io_async::Error for BufStreamError<T> {
 pub struct BufStream<T: BlockDevice<SIZE>, const SIZE: usize> {
     inner: T,
     // Primary cache slot. `read`/`write` always operate on this slot.
-    buffer: block_device_driver::DmaBlock<SIZE>,
+    //
+    // The two cache slots are BORROWED (`&'static mut`), not owned, so a mounted
+    // `FileSystem` stays a lightweight handle (pointers + bookkeeping) instead of
+    // dragging ~1 KB of DMA cache by value onto every frame / across every await.
+    // The caller provides the backing storage — on-target a `static` in dram2,
+    // in host tests a per-test buffer — see `new`.
+    buffer: &'static mut block_device_driver::DmaBlock<SIZE>,
     current_block: u32,
     dirty: bool,
     // Shadow cache slot. Holds the "other" recently-touched block so
@@ -62,7 +72,7 @@ pub struct BufStream<T: BlockDevice<SIZE>, const SIZE: usize> {
     // because every tiny FAT-entry write forced a full read-modify-
     // write cycle for both FAT mirrors, hitting the same two sectors
     // hundreds of times in a few seconds.
-    shadow_buffer: block_device_driver::DmaBlock<SIZE>,
+    shadow_buffer: &'static mut block_device_driver::DmaBlock<SIZE>,
     shadow_block: u32,
     shadow_dirty: bool,
     current_offset: u64,
@@ -70,15 +80,23 @@ pub struct BufStream<T: BlockDevice<SIZE>, const SIZE: usize> {
 
 impl<T: BlockDevice<SIZE>, const SIZE: usize> BufStream<T, SIZE> {
     const ALIGN: usize = core::mem::align_of::<block_device_driver::DmaBlock<SIZE>>();
-    /// Create a new [`BufStream`] around a hardware block device.
-    pub fn new(inner: T) -> Self {
+    /// Create a new [`BufStream`] around a hardware block device, backed by two
+    /// caller-provided cache slots (`&'static mut`). On-target these come from a
+    /// `static` placed in dram2 (off the main stack); host tests pass leaked
+    /// per-test buffers. Externalising the cache keeps the mounted `FileSystem`
+    /// a lightweight, cheaply-movable handle instead of an owned ~1 KB cache.
+    pub fn new(
+        inner: T,
+        buffer: &'static mut block_device_driver::DmaBlock<SIZE>,
+        shadow_buffer: &'static mut block_device_driver::DmaBlock<SIZE>,
+    ) -> Self {
         Self {
             inner,
             current_block: u32::MAX,
             current_offset: 0,
-            buffer: Aligned([0; SIZE]),
+            buffer,
             dirty: false,
-            shadow_buffer: Aligned([0; SIZE]),
+            shadow_buffer,
             shadow_block: u32::MAX,
             shadow_dirty: false,
         }
@@ -321,6 +339,18 @@ mod tests {
 
     use super::*;
 
+    // The live `BufStream::new` borrows two caller-owned `&'static mut DmaBlock`
+    // cache slots (externalised so a mounted `FileSystem` is a lightweight
+    // handle). Tests don't have a dram2 static, so leak a fresh pair per stream
+    // — short-lived test processes, so the leak is irrelevant.
+    fn new_test<T: BlockDevice<512>>(inner: T) -> BufStream<T, 512> {
+        BufStream::new(
+            inner,
+            Box::leak(Box::new(Aligned([0u8; 512]))),
+            Box::leak(Box::new(Aligned([0u8; 512]))),
+        )
+    }
+
     struct TestBlockDevice<T: Read + Write + Seek>(T);
 
     impl<T: Read + Write + Seek> ErrorType for TestBlockDevice<T> {
@@ -392,7 +422,7 @@ mod tests {
         let _ = env_logger::builder().is_test(true).try_init();
         let buf = ("A".repeat(512) + "B".repeat(512).as_str()).into_bytes();
         let cur = std::io::Cursor::new(buf);
-        let mut block: BufStream<_, 512> = BufStream::new(TestBlockDevice(
+        let mut block: BufStream<_, 512> = new_test(TestBlockDevice(
             embedded_io_adapters::tokio_1::FromTokio::new(cur),
         ));
 
@@ -421,7 +451,7 @@ mod tests {
             .repeat(16)
             .into_bytes();
         let cur = std::io::Cursor::new(buf);
-        let mut block: BufStream<_, 512> = BufStream::new(TestBlockDevice(
+        let mut block: BufStream<_, 512> = new_test(TestBlockDevice(
             embedded_io_adapters::tokio_1::FromTokio::new(cur),
         ));
 
@@ -447,7 +477,7 @@ mod tests {
         let _ = env_logger::builder().is_test(true).try_init();
         let buf = vec![0; 2048];
         let cur = std::io::Cursor::new(buf);
-        let mut block: BufStream<_, 512> = BufStream::new(TestBlockDevice(
+        let mut block: BufStream<_, 512> = new_test(TestBlockDevice(
             embedded_io_adapters::tokio_1::FromTokio::new(cur),
         ));
 
@@ -466,7 +496,7 @@ mod tests {
         let _ = env_logger::builder().is_test(true).try_init();
         let buf = vec![0; 2048];
         let cur = std::io::Cursor::new(buf);
-        let mut block: BufStream<_, 512> = BufStream::new(TestBlockDevice(
+        let mut block: BufStream<_, 512> = new_test(TestBlockDevice(
             embedded_io_adapters::tokio_1::FromTokio::new(cur),
         ));
 
@@ -486,7 +516,7 @@ mod tests {
         let _ = env_logger::builder().is_test(true).try_init();
         let buf = vec![0; 2048];
         let cur = std::io::Cursor::new(buf);
-        let mut block: BufStream<_, 512> = BufStream::new(TestBlockDevice(
+        let mut block: BufStream<_, 512> = new_test(TestBlockDevice(
             embedded_io_adapters::tokio_1::FromTokio::new(cur),
         ));
 
@@ -512,7 +542,7 @@ mod tests {
         let _ = env_logger::builder().is_test(true).try_init();
         let buf = vec![0; 2048];
         let cur = std::io::Cursor::new(buf);
-        let mut block: BufStream<_, 512> = BufStream::new(TestBlockDevice(
+        let mut block: BufStream<_, 512> = new_test(TestBlockDevice(
             embedded_io_adapters::tokio_1::FromTokio::new(cur),
         ));
 
@@ -539,7 +569,7 @@ mod tests {
         let _ = env_logger::builder().is_test(true).try_init();
         let buf = "A".repeat(2048).into_bytes();
         let cur = std::io::Cursor::new(buf);
-        let mut block: BufStream<_, 512> = BufStream::new(TestBlockDevice(
+        let mut block: BufStream<_, 512> = new_test(TestBlockDevice(
             embedded_io_adapters::tokio_1::FromTokio::new(cur),
         ));
 
@@ -563,7 +593,7 @@ mod tests {
         let _ = env_logger::builder().is_test(true).try_init();
         let buf = "A".repeat(2048).into_bytes();
         let cur = std::io::Cursor::new(buf);
-        let mut block: BufStream<_, 512> = BufStream::new(TestBlockDevice(
+        let mut block: BufStream<_, 512> = new_test(TestBlockDevice(
             embedded_io_adapters::tokio_1::FromTokio::new(cur),
         ));
 
@@ -589,7 +619,7 @@ mod tests {
         let _ = env_logger::builder().is_test(true).try_init();
         let buf = "A".repeat(2048).into_bytes();
         let cur = std::io::Cursor::new(buf);
-        let mut block: BufStream<_, 512> = BufStream::new(TestBlockDevice(
+        let mut block: BufStream<_, 512> = new_test(TestBlockDevice(
             embedded_io_adapters::tokio_1::FromTokio::new(cur),
         ));
 
