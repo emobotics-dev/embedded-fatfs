@@ -460,6 +460,23 @@ impl BootSector {
             );
             return Err(Error::CorruptedFileSystem);
         }
+        // A DOS/GPT-protective MBR (partition table) also ends in the 0x55AA
+        // signature, but it has no BPB: byte 0 is not a jump (it's boot code or
+        // zero) and the bytes the BPB would occupy read as 0. Detect that here
+        // and fail with one actionable error, instead of letting the caller wade
+        // through "Unknown opcode 0 in bootjmp" + "bytes_per_sector ... got 0" +
+        // a bare CorruptedFileSystem. This mounts a *volume*, not a disk: if the
+        // device is partitioned, slice to the partition (e.g. with a StreamSlice
+        // over the first FAT entry) before handing it to `FileSystem::new`.
+        if self.bootjmp[0] != 0xEB && self.bootjmp[0] != 0xE9 && self.bpb.bytes_per_sector == 0 {
+            error!(
+                "Sector 0 has a 0x55AA signature but no BPB (bytes_per_sector=0): this is an \
+                 MBR/partition table, not a FAT volume. Mount a partition (slice to its first \
+                 sector), not the whole disk — or, if you intended a superfloppy, the device is \
+                 not formatted as one."
+            );
+            return Err(Error::CorruptedFileSystem);
+        }
         if self.bootjmp[0] != 0xEB && self.bootjmp[0] != 0xE9 {
             warn!("Unknown opcode {:x} in bootjmp boot sector field", self.bootjmp[0]);
         }
