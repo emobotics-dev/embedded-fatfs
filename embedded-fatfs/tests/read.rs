@@ -358,6 +358,24 @@ async fn test_stats_fat32() {
 }
 
 #[tokio::test]
+async fn test_free_clusters_hint() {
+    // FAT12/FAT16 have no FS Information Sector, so the O(1) hint is unknown
+    // until a `stats()` scan populates the cache; afterwards it matches and
+    // still never scans.
+    for img in [FAT12_IMG, FAT16_IMG] {
+        let fs = create_fs(img).await;
+        assert_eq!(fs.free_clusters_hint(), None);
+        let free = fs.stats().await.unwrap().free_clusters();
+        assert_eq!(fs.free_clusters_hint(), Some(free));
+    }
+    // FAT32: whatever the initial FSInfo state, after a `stats()` the hint is
+    // populated and equals the counted value.
+    let fs = create_fs(FAT32_IMG).await;
+    let free = fs.stats().await.unwrap().free_clusters();
+    assert_eq!(fs.free_clusters_hint(), Some(free));
+}
+
+#[tokio::test]
 async fn test_multi_thread() {
     use std::sync::{Arc, Mutex};
     use std::thread;
