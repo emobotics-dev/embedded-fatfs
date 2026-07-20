@@ -489,6 +489,17 @@ impl<IO: ReadWriteSeek, TP, OCC> FileSystem<IO, TP, OCC> {
         self.bpb.cluster_size()
     }
 
+    /// Total number of clusters usable for file allocation, `O(1)`.
+    ///
+    /// Same value as [`FileSystemStats::total_clusters`], available without a
+    /// [`stats`](Self::stats) call — pair it with
+    /// [`free_clusters_hint`](Self::free_clusters_hint) to report used/free space
+    /// without ever scanning the FAT.
+    #[must_use]
+    pub fn total_clusters(&self) -> u32 {
+        self.total_clusters
+    }
+
     pub(crate) fn offset_from_cluster(&self, cluster: u32) -> u64 {
         self.offset_from_sector(self.sector_from_cluster(cluster))
     }
@@ -564,8 +575,20 @@ impl<IO: ReadWriteSeek, TP, OCC> FileSystem<IO, TP, OCC> {
 
     /// Returns filesystem statistics like number of total and free clusters.
     ///
-    /// For FAT32 volumes number of free clusters from the FS Information Sector is returned (may be incorrect).
-    /// For other FAT variants number is computed on the first call to this method and cached for later use.
+    /// The free-cluster count comes from the FS Information Sector cache when a
+    /// valid one is available (a FAT32 volume whose FSInfo carries a count, kept
+    /// in sync by allocation/free). Otherwise — FAT12/FAT16, or a FAT32 volume
+    /// whose FSInfo count is absent, unknown (`0xFFFF_FFFF`) or invalid — it is
+    /// computed by scanning the FAT on the first call and cached for later use.
+    ///
+    /// # Performance
+    ///
+    /// That fallback scan reads the **entire** FAT (every cluster entry), so it
+    /// is `O(volume size)` and, on a large volume over slow storage (e.g. an SD
+    /// card at multi-GB), can take *tens of seconds*. If you cannot afford that —
+    /// and only need the count when it is already known — call
+    /// [`free_clusters_hint`](Self::free_clusters_hint) instead, which never
+    /// scans.
     ///
     /// # Errors
     ///
@@ -582,6 +605,24 @@ impl<IO: ReadWriteSeek, TP, OCC> FileSystem<IO, TP, OCC> {
             total_clusters: self.total_clusters,
             free_clusters,
         })
+    }
+
+    /// Free-cluster count from the cached FS Information Sector value **without
+    /// scanning the FAT** — `O(1)`.
+    ///
+    /// Returns `Some(n)` when a valid cached count is available (a FAT32 volume
+    /// whose FSInfo carried one at mount, kept in sync by allocation/free, or
+    /// after a prior [`stats`](Self::stats) call has computed and cached it).
+    /// Returns `None` when there is no cached count — FAT12/FAT16, or a FAT32
+    /// volume whose FSInfo count is absent, unknown or invalid — in which case
+    /// the only way to obtain it is [`stats`](Self::stats), which scans the FAT.
+    ///
+    /// Prefer this over [`stats`](Self::stats) when the full-FAT scan is
+    /// unaffordable and an unknown count can simply be skipped (e.g. showing free
+    /// space in a UI only when it is cheaply available).
+    #[must_use]
+    pub fn free_clusters_hint(&self) -> Option<u32> {
+        self.fs_info.borrow().free_cluster_count
     }
 
     /// Forces free clusters recalculation.
