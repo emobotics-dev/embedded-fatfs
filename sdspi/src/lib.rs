@@ -6,7 +6,6 @@ use block_device_driver::DmaBlock;
 use core::fmt::Debug;
 use core::future::Future;
 use embassy_futures::select::{select, Either};
-use embassy_futures::yield_now;
 use sdio_host::sd::{CardCapacity, CID, CSD, OCR, SD};
 use sdio_host::{common_cmd::*, sd_cmd::*};
 
@@ -21,6 +20,13 @@ pub const R1_IDLE_STATE: u8 = 0x01;
 pub const R1_ILLEGAL_COMMAND: u8 = 0x04;
 /// Start data token for read or write single block*/
 pub const DATA_START_BLOCK: u8 = 0xFE;
+
+/// Bytes clocked while searching for the data-start token, inside the same
+/// transaction as the data itself (see `SdSpi::read_data`). Nac is short in
+/// practice; a window that misses simply fails the command and the caller
+/// re-issues it, which is a legal protocol restart — unlike continuing a
+/// half-read with CS dropped.
+const TOKEN_SCAN: usize = 32;
 /// Stop token for write multiple blocks*/
 pub const STOP_TRAN_TOKEN: u8 = 0xFD;
 /// Start data token for write multiple blocks*/
@@ -421,40 +427,95 @@ where
         Ok(())
     }
 
+    /// Read one data block: token search, payload and CRC in **one**
+    /// `SpiDevice` transaction.
+    ///
+    /// This must be a single transaction, and that is the whole point. Every
+    /// `SpiDevice` call asserts CS, runs, then releases CS *and the shared-bus
+    /// mutex*. The previous implementation polled for the 0xFE start token one
+    /// byte at a time — a separate transaction per byte, with a `yield_now()`
+    /// between them — so on a bus shared with the display the LVGL flush could
+    /// take the bus mid-data-phase and clock the card's payload away. The next
+    /// poll then read sector *content* where the token belonged: observed as
+    /// `RegisterError(82)`, 82 being the `R` of the FsInfo sector's own "RRaA"
+    /// signature, followed by a FAT full of garbage and a format that fails
+    /// with `NotEnoughSpace`.
+    ///
+    /// The SD spec requires CS asserted for the entire read data phase, so the
+    /// byte-at-a-time poll was always a protocol violation; it survived only
+    /// because LVGL's `waiti 0` flush wait happened to keep the display off the
+    /// bus. Moving the render loop to its own thread removed that accidental
+    /// exclusion and turned it into corruption on the first armed session.
+    ///
+    /// The token can land anywhere in the scan window, so the payload arrives
+    /// offset by however many bytes followed it — hence the reassembly below
+    /// rather than a plain read.
     async fn read_data(&mut self, buffer: &mut [u8]) -> Result<(), Error> {
-        // Same rationale as `wait_idle` — yield between polls while
-        // waiting for the data-start token so other async tasks on
-        // the same executor are not starved.
-        let outer = with_timeout(self.delay.clone(), 1000, async {
-            let mut byte = self.read_byte().await?;
-            while byte == 0xFF {
-                yield_now().await;
-                byte = self.read_byte().await?;
-            }
-            Ok(byte)
-        })
-        .await;
-        if let Err(Error::Timeout) = outer {
-            error!("sdspi: read_data data-start token wait timed out after 1000 ms");
-        }
-        let r = outer??;
+        // Length-generic on purpose: this serves 512-byte data blocks AND the
+        // 16-byte CSD/CID register reads during init, so nothing here may
+        // assume 512.
+        let n = buffer.len();
 
-        if r != DATA_START_BLOCK {
-            return Err(Error::RegisterError(r));
-        }
+        // ESP32 PDMA requires 4-byte-aligned DMA buffers and `[u8; N]` on the
+        // stack is alignment 1 (see the wait_idle probe comment) — back both
+        // scratch buffers with `[u32; _]`.
+        let mut scan_words = [0xFFFF_FFFFu32; TOKEN_SCAN / 4];
+        // SAFETY: `[u32; N]` is 4-aligned and N*4 bytes long; the byte view
+        // aliases the same storage for the duration of this call only.
+        let scan: &mut [u8; TOKEN_SCAN] =
+            unsafe { &mut *(scan_words.as_mut_ptr() as *mut [u8; TOKEN_SCAN]) };
+        let mut tail_word = [0xFFFF_FFFFu32; 1];
+        // SAFETY: as above — only the first two bytes are used (the CRC).
+        let tail: &mut [u8; 4] = unsafe { &mut *(tail_word.as_mut_ptr() as *mut [u8; 4]) };
 
-        // Read data block + 2 CRC bytes in one SpiDevice transaction
-        // so CS stays asserted for the entire data phase.
         buffer.fill(0xFF);
-        let mut crc_bytes = [0xFFu8; 2];
         use embedded_hal_async::spi::Operation;
         self.spi
             .transaction(&mut [
+                Operation::TransferInPlace(scan),
                 Operation::TransferInPlace(buffer),
-                Operation::TransferInPlace(&mut crc_bytes),
+                Operation::TransferInPlace(tail),
             ])
             .await
             .map_err(|_| Error::SpiError)?;
+
+        let Some(i) = scan.iter().position(|&b| b == DATA_START_BLOCK) else {
+            // No token in the window. Report the last byte seen, matching the
+            // old error shape, and let the caller re-issue the command.
+            return Err(Error::RegisterError(scan[TOKEN_SCAN - 1]));
+        };
+
+        // `k` payload bytes were clocked after the token inside the window, so
+        // the byte stream following the token is
+        //     scan[i+1..] (k bytes) ++ buffer (n) ++ tail (4)
+        // of which the first `n` are the payload and the next 2 the CRC. That
+        // is k + n + 4 bytes available for n + 2 needed, for any k.
+        let k = TOKEN_SCAN - 1 - i;
+        let head = &scan[i + 1..];
+
+        // CRC first: after the shift below, `buffer` no longer holds the
+        // stream-ordered bytes these indices refer to.
+        let mut crc_bytes = [0u8; 2];
+        for (j, out) in crc_bytes.iter_mut().enumerate() {
+            let idx = n + j;
+            *out = if idx < k {
+                head[idx]
+            } else if idx < k + n {
+                buffer[idx - k]
+            } else {
+                tail[idx - k - n]
+            };
+        }
+
+        if k >= n {
+            // Whole payload arrived inside the scan window (short reads: CSD/CID).
+            buffer.copy_from_slice(&head[..n]);
+        } else if k > 0 {
+            // Slide the payload right by k, then fill the front from the window.
+            buffer.copy_within(0..n - k, k);
+            buffer[..k].copy_from_slice(&head[..k]);
+        }
+
         let crc = u16::from_be_bytes(crc_bytes);
         let calc_crc = crc16(buffer);
         if crc != calc_crc {
