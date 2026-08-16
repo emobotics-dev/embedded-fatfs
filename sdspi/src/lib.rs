@@ -103,19 +103,47 @@ where
 /// bus master. Between commands — and inside `wait_idle_sustained_ms`, between
 /// busy probes — the guard is dropped, which is what lets a display flush share
 /// the bus during a multi-second erase.
-use embedded_hal_async::spi::SpiDevice as _;
+use embedded_hal_async::spi::SpiBus as _;
+use embedded_hal::digital::OutputPin as _;
 
 pub trait BusAccess {
-    /// The bus handle a guard hands out.
-    type Device: embedded_hal_async::spi::SpiDevice;
+    /// The raw bus. NOT a `SpiDevice`: a `SpiDevice` asserts CS on entry to
+    /// every call and deasserts on exit, so a command built from several calls
+    /// drops CS in the middle of itself. Taking the bus and the chip-select
+    /// separately is what lets CS stay low for a whole command, including the
+    /// unbounded `0xFE` data-token wait that cannot fit in one transaction.
+    type Bus: embedded_hal_async::spi::SpiBus;
+    /// The card's chip-select, driven by this driver rather than by a device
+    /// wrapper.
+    type Cs: embedded_hal::digital::OutputPin;
     /// Held for one command; dropping it releases the bus.
-    type Guard<'a>: core::ops::DerefMut<Target = Self::Device>
+    type Guard<'a>: BusAndCs<Bus = Self::Bus, Cs = Self::Cs>
     where
         Self: 'a;
 
     /// Take the bus. `None` means the arbiter gave up waiting — the caller
     /// fails the command rather than proceeding unlocked.
     fn acquire(&self) -> impl core::future::Future<Output = Option<Self::Guard<'_>>>;
+}
+
+/// A guard lending the bus and the chip-select together.
+///
+/// Together is the point: CS asserted while another master can drive the bus
+/// would clock that master's bytes into a selected card, which is worse than
+/// the CS drops this replaces. Whatever provides this must hold both.
+///
+/// # Contract
+///
+/// **Dropping the guard MUST deassert CS.** The driver asserts it once per
+/// command and then uses `?` freely; every early return therefore releases the
+/// card by dropping the guard. Releasing the bus and deselecting the card are
+/// the same event, so the deselect belongs with the release — an implementation
+/// that leaves CS low after drop leaves the card selected while another master
+/// owns the bus.
+pub trait BusAndCs {
+    type Bus: embedded_hal_async::spi::SpiBus;
+    type Cs: embedded_hal::digital::OutputPin;
+    fn split(&mut self) -> (&mut Self::Bus, &mut Self::Cs);
 }
 
 pub struct SdSpi<A, D>
@@ -146,25 +174,18 @@ where
         self.bus.acquire().await.ok_or(Error::BusUnavailable)
     }
 
-    /// Run `f` against the bus with the lock held.
-    ///
-    /// Replaces the deleted `spi()` accessor. Its one legitimate caller raises
-    /// the clock after init, which genuinely needs the device — but handing out
-    /// `&mut Device` unconditionally is what made unlocked access
-    /// representable. Here the reference cannot outlive the guard, so the
-    /// property survives the convenience.
-    pub async fn with_bus<R>(&self, f: impl FnOnce(&mut A::Device) -> R) -> Result<R, Error> {
-        let mut guard = self.lock().await?;
-        Ok(f(&mut guard))
-    }
-
     /// To comply with the SD card spec, [sd_init] must be called between powerup and calling this function.
     pub async fn init(&mut self) -> Result<(), Error> {
         // One lock for the WHOLE command: the card sees command, token wait and
         // payload with no other master able to interleave. Released on return,
         // so the next command and the display both get their turn.
         let mut _guard = self.lock().await?;
-        let spi = &mut *_guard;
+        // CS low for the WHOLE command, released after the last operation. This
+        // is the guard: the individual transfers below no longer touch CS, so
+        // it cannot rise mid-command — not even across the unbounded 0xFE
+        // token wait, which is what no fixed `transaction()` could express.
+        let (spi, cs) = _guard.split();
+        cs.set_low().map_err(|_| Error::ChipSelect)?;
         let r = async {
             with_timeout(self.delay.clone(), 1000, async {
                 loop {
@@ -202,10 +223,7 @@ where
                         return Err(Error::UnsupportedCard);
                     }
                     let mut buffer = [0xFFu8; 4];
-                    spi
-                        .transfer_in_place(&mut buffer[..])
-                        .await
-                        .map_err(|_| Error::SpiError)?;
+                    spi.transfer_in_place(&mut buffer[..]).await.map_err(|_| Error::SpiError)?;
                     if buffer[3] == 0xAA {
                         return Ok(());
                     }
@@ -241,10 +259,7 @@ where
                         return Err(Error::Cmd58Error);
                     }
                     let mut buffer = [0xFFu8; 4];
-                    spi
-                        .transfer_in_place(&mut buffer[..])
-                        .await
-                        .map_err(|_| Error::SpiError)?;
+                    spi.transfer_in_place(&mut buffer[..]).await.map_err(|_| Error::SpiError)?;
                     let ocr: OCR<SD> = u32::from_be_bytes(buffer).into();
                     if !ocr.is_busy() {
                         return Ok(ocr);
@@ -297,7 +312,12 @@ where
         // payload with no other master able to interleave. Released on return,
         // so the next command and the display both get their turn.
         let mut _guard = self.lock().await?;
-        let spi = &mut *_guard;
+        // CS low for the WHOLE command, released after the last operation. This
+        // is the guard: the individual transfers below no longer touch CS, so
+        // it cannot rise mid-command — not even across the unbounded 0xFE
+        // token wait, which is what no fixed `transaction()` could express.
+        let (spi, cs) = _guard.split();
+        cs.set_low().map_err(|_| Error::ChipSelect)?;
         let n = data.len();
         let r = async {
             if n == 1 {
@@ -343,7 +363,12 @@ where
         // payload with no other master able to interleave. Released on return,
         // so the next command and the display both get their turn.
         let mut _guard = self.lock().await?;
-        let spi = &mut *_guard;
+        // CS low for the WHOLE command, released after the last operation. This
+        // is the guard: the individual transfers below no longer touch CS, so
+        // it cannot rise mid-command — not even across the unbounded 0xFE
+        // token wait, which is what no fixed `transaction()` could express.
+        let (spi, cs) = _guard.split();
+        cs.set_low().map_err(|_| Error::ChipSelect)?;
         let n = data.len();
         let r = async {
             if n == 1 {
@@ -441,7 +466,12 @@ where
         // the display for the whole format. That wait re-acquires per probe.
         {
         let mut _guard = self.lock().await?;
-        let spi = &mut *_guard;
+        // CS low for the WHOLE command, released after the last operation. This
+        // is the guard: the individual transfers below no longer touch CS, so
+        // it cannot rise mid-command — not even across the unbounded 0xFE
+        // token wait, which is what no fixed `transaction()` could express.
+        let (spi, cs) = _guard.split();
+        cs.set_low().map_err(|_| Error::ChipSelect)?;
 
         let r = self.cmd(spi, cmd::<R1>(32, start_block)).await?;
         if r != R1_READY_STATE {
@@ -503,7 +533,7 @@ where
         Ok(())
     }
 
-    async fn read_data(&self, spi: &mut A::Device, buffer: &mut [u8]) -> Result<(), Error> {
+    async fn read_data(&self, spi: &mut A::Bus, buffer: &mut [u8]) -> Result<(), Error> {
         // Same rationale as `wait_idle` — yield between polls while
         // waiting for the data-start token so other async tasks on
         // the same executor are not starved.
@@ -529,14 +559,11 @@ where
         // so CS stays asserted for the entire data phase.
         buffer.fill(0xFF);
         let mut crc_bytes = [0xFFu8; 2];
-        use embedded_hal_async::spi::Operation;
         spi
-            .transaction(&mut [
-                Operation::TransferInPlace(buffer),
-                Operation::TransferInPlace(&mut crc_bytes),
-            ])
+            .transfer_in_place(buffer)
             .await
             .map_err(|_| Error::SpiError)?;
+        spi.transfer_in_place(&mut crc_bytes).await.map_err(|_| Error::SpiError)?;
         let crc = u16::from_be_bytes(crc_bytes);
         let calc_crc = crc16(buffer);
         if crc != calc_crc {
@@ -546,7 +573,7 @@ where
         Ok(())
     }
 
-    async fn write_data(&self, spi: &mut A::Device, token: u8, buffer: &[u8]) -> Result<(), Error> {
+    async fn write_data(&self, spi: &mut A::Bus, token: u8, buffer: &[u8]) -> Result<(), Error> {
         // Send token + data + CRC + read data-response window as one
         // SpiDevice transaction. CS must stay asserted across the
         // whole write-data phase per the SD SPI spec.
@@ -569,16 +596,13 @@ where
         let status_buf: &mut [u8; 8] = unsafe {
             &mut *(status_word.as_mut_ptr() as *mut [u8; 8])
         };
-        use embedded_hal_async::spi::Operation;
         spi
-            .transaction(&mut [
-                Operation::Write(&token_buf),
-                Operation::Write(buffer),
-                Operation::Write(&crc_bytes),
-                Operation::TransferInPlace(status_buf),
-            ])
+            .write(&token_buf)
             .await
             .map_err(|_| Error::SpiError)?;
+        spi.write(buffer).await.map_err(|_| Error::SpiError)?;
+        spi.write(&crc_bytes).await.map_err(|_| Error::SpiError)?;
+        spi.transfer_in_place(status_buf).await.map_err(|_| Error::SpiError)?;
 
         for &b in &*status_buf {
             if b != 0xFF {
@@ -607,7 +631,7 @@ where
     // precisely what makes bus access representable without the lock, and one
     // caller using it would reintroduce the whole class silently.
 
-    async fn cmd<R: Resp>(&self, spi: &mut A::Device, cmd: Cmd<R>) -> Result<u8, Error> {
+    async fn cmd<R: Resp>(&self, spi: &mut A::Bus, cmd: Cmd<R>) -> Result<u8, Error> {
         if cmd.cmd != idle().cmd {
             self.wait_idle(spi).await?;
         }
@@ -663,25 +687,22 @@ where
         };
         let mut stuff = [0xFFu8; 1];
 
-        use embedded_hal_async::spi::Operation;
         if cmd.cmd == stop_transmission().cmd {
             // CMD12 has a mandatory stuff byte before R1 (SPI-mode
             // erratum). Keep the original two-slot read.
             spi
-                .transaction(&mut [
-                    Operation::Write(&buf),
-                    Operation::TransferInPlace(&mut stuff),
-                    Operation::TransferInPlace(&mut response[..1]),
-                ])
+                .write(&buf)
                 .await
                 .map_err(|_| Error::SpiError)?;
+            spi.transfer_in_place(&mut stuff).await.map_err(|_| Error::SpiError)?;
+            spi.transfer_in_place(&mut response[..1]).await.map_err(|_| Error::SpiError)?;
         } else {
             let resp_len = if has_trailing_bytes { 1 } else { 8 };
             spi
-                .transaction(&mut [
-                    Operation::Write(&buf),
-                    Operation::TransferInPlace(&mut response[..resp_len]),
-                ])
+                .write(&buf)
+                .await
+                .map_err(|_| Error::SpiError)?;
+            spi.transfer_in_place(&mut response[..resp_len])
                 .await
                 .map_err(|_| Error::SpiError)?;
         }
@@ -731,19 +752,19 @@ where
         Ok(byte)
     }
 
-    async fn acmd<R: Resp>(&self, spi: &mut A::Device, cmd: Cmd<R>) -> Result<u8, Error> {
+    async fn acmd<R: Resp>(&self, spi: &mut A::Bus, cmd: Cmd<R>) -> Result<u8, Error> {
         self.cmd(spi, app_cmd(self.card.map(|c| c.rca).unwrap_or(0) as u16))
             .await?;
         self.cmd(spi, cmd).await
     }
 
-    async fn wait_idle(&self, spi: &mut A::Device) -> Result<(), Error> {
+    async fn wait_idle(&self, spi: &mut A::Bus) -> Result<(), Error> {
         self.wait_idle_with_timeout_ms(spi, 10_000).await
     }
 
     /// Default `wait_idle` semantics: return at the first all-0xFF
     /// 8-byte probe. Used for fast-path per-write idle confirmation.
-    async fn wait_idle_with_timeout_ms(&self, spi: &mut A::Device, timeout_ms: u32) -> Result<(), Error> {
+    async fn wait_idle_with_timeout_ms(&self, spi: &mut A::Bus, timeout_ms: u32) -> Result<(), Error> {
         self.wait_idle_sustained_ms(spi, timeout_ms, 1).await
     }
 
@@ -773,20 +794,21 @@ where
     ///
     /// The caller must NOT hold a guard when calling this.
     async fn wait_idle_reacquiring(&self, timeout_ms: u32, sustained_count: u32) -> Result<(), Error> {
-        use embedded_hal_async::spi::Operation;
         let target = sustained_count.max(1);
         let outer = with_timeout(self.delay.clone(), timeout_ms, async {
             let mut consec: u32 = 0;
             loop {
                 let idle = {
                     let mut guard = self.bus.acquire().await.ok_or(Error::BusUnavailable)?;
+                    let (bus, cs) = guard.split();
+                    cs.set_low().map_err(|_| Error::ChipSelect)?;
                     // 4-aligned backing: ESP32 PDMA needs it (see the locked
                     // variant's note).
                     let mut probe_word = [0xFFFF_FFFFu32; 2];
                     let probe: &mut [u8; 8] =
                         unsafe { &mut *(probe_word.as_mut_ptr() as *mut [u8; 8]) };
-                    guard
-                        .transaction(&mut [Operation::TransferInPlace(probe)])
+                    bus
+                        .transfer_in_place(probe)
                         .await
                         .map_err(|_| Error::SpiError)?;
                     probe.iter().all(|&b| b == 0xFF)
@@ -815,11 +837,10 @@ where
     /// [`Self::wait_idle_reacquiring`].
     async fn wait_idle_sustained_ms(
         &self,
-        spi: &mut A::Device,
+        spi: &mut A::Bus,
         timeout_ms: u32,
         sustained_count: u32,
     ) -> Result<(), Error> {
-        use embedded_hal_async::spi::Operation;
         let target = sustained_count.max(1);
         // Atomic counter so we can tell on timeout whether polling ran
         // normally (≈ timeout_ms polls — card stayed busy) or was starved
@@ -854,10 +875,7 @@ where
                 let probe: &mut [u8; 8] = unsafe {
                     &mut *(probe_word.as_mut_ptr() as *mut [u8; 8])
                 };
-                spi
-                    .transaction(&mut [Operation::TransferInPlace(probe)])
-                    .await
-                    .map_err(|_| Error::SpiError)?;
+                spi.transfer_in_place(probe).await.map_err(|_| Error::SpiError)?;
                 POLLS.fetch_add(1, Ordering::Relaxed);
                 if probe.iter().all(|&b| b == 0xFF) {
                     consec += 1;
@@ -881,12 +899,9 @@ where
         outer?
     }
 
-    async fn read_byte(&self, spi: &mut A::Device) -> Result<u8, Error> {
+    async fn read_byte(&self, spi: &mut A::Bus) -> Result<u8, Error> {
         let mut buf = [0xFFu8; 1];
-        spi
-            .transfer_in_place(&mut buf[..])
-            .await
-            .map_err(|_| Error::SpiError)?;
+        spi.transfer_in_place(&mut buf[..]).await.map_err(|_| Error::SpiError)?;
 
         Ok(buf[0])
     }
