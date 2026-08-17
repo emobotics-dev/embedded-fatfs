@@ -92,16 +92,11 @@ where
 /// The only way to reach the SPI bus.
 ///
 /// `SdSpi` holds one of these instead of a device, so a command that forgets to
-/// take the lock has nothing to talk to and does not compile. That is the whole
-/// point: the previous arrangement was an app-level `acquire_bus()` call which
-/// any path could simply not make, and the erase path deliberately did not.
+/// lock has nothing to talk to and does not compile.
 ///
-/// Granularity is per COMMAND, not per operation and not per session: a public
-/// method acquires once and passes the guard down to its helpers, so CS-visible
-/// sequences (command, token wait, payload) cannot be interleaved by another
-/// bus master. Between commands — and inside `wait_idle_sustained_ms`, between
-/// busy probes — the guard is dropped, which is what lets a display flush share
-/// the bus during a multi-second erase.
+/// Granularity is per COMMAND: acquire once, pass the guard to the helpers, so
+/// command/token-wait/payload cannot be interleaved. Released between commands
+/// and between busy probes, which is what lets the display share the bus.
 use embedded_hal_async::spi::SpiBus as _;
 use embedded_hal::digital::OutputPin as _;
 
@@ -125,20 +120,14 @@ pub trait BusAccess {
     fn acquire(&self) -> impl core::future::Future<Output = Option<Self::Guard<'_>>>;
 }
 
-/// A guard lending the bus and the chip-select together.
-///
-/// Together is the point: CS asserted while another master can drive the bus
-/// would clock that master's bytes into a selected card, which is worse than
-/// the CS drops this replaces. Whatever provides this must hold both.
+/// A guard lending bus and chip-select together. Together, because CS asserted
+/// while another master can drive the bus is worse than the CS drops this
+/// replaces.
 ///
 /// # Contract
 ///
-/// **Dropping the guard MUST deassert CS.** The driver asserts it once per
-/// command and then uses `?` freely; every early return therefore releases the
-/// card by dropping the guard. Releasing the bus and deselecting the card are
-/// the same event, so the deselect belongs with the release — an implementation
-/// that leaves CS low after drop leaves the card selected while another master
-/// owns the bus.
+/// **Dropping the guard MUST deassert CS** — the driver asserts once per
+/// command and then uses `?` freely, so every early return releases the card.
 pub trait BusAndCs {
     type Bus: embedded_hal_async::spi::SpiBus;
     type Cs: embedded_hal::digital::OutputPin;
@@ -168,12 +157,9 @@ where
         }
     }
 
-    /// Wait for the card to finish whatever it is doing, WITHOUT holding the
-    /// bus.
-    ///
-    /// Called before acquiring, so a card still programming a previous write
-    /// does not pin the bus — the display gets it between probes, and the block
-    /// layer's per-op backstop is not spent waiting for the card.
+    /// Wait for the card to go idle WITHOUT holding the bus. Called before
+    /// acquiring: a card still programming a previous write must not pin the
+    /// bus, or the block layer's backstop is spent waiting for it.
     async fn settle(&self) -> Result<(), Error> {
         self.wait_idle_reacquiring(10_000, 1).await
     }
@@ -183,25 +169,15 @@ where
         self.bus.acquire().await.ok_or(Error::BusUnavailable)
     }
 
-    /// The arbiter this driver reaches the bus through.
-    ///
-    /// Hands out the ARBITER, not the bus: callers can ask it for board-level
-    /// settings (the post-init SD clock, say) without gaining a way to talk to
-    /// the card outside a guard. That distinction is the whole point of the
-    /// type — `spi()` used to return the device itself and had to be deleted.
+    /// The arbiter, NOT the bus: callers can reach board-level settings (the
+    /// post-init clock) without gaining a way to talk to the card unlocked.
     pub fn bus(&self) -> &A {
         &self.bus
     }
 
-    /// Run `f` against the bus and chip-select, with the bus held.
-    ///
-    /// For things that are neither a command nor optional — raising the SD
-    /// clock once the card has answered, above all. That has to happen under
-    /// the guard like everything else, and it cannot go through a per-device
-    /// config any more because the driver drives the bus directly.
-    ///
-    /// The references cannot outlive the guard, so this does not reopen the
-    /// unlocked-access hole that deleting `spi()` closed.
+    /// Run `f` against bus + CS with the bus held. For non-command work (the
+    /// post-init clock raise). References cannot outlive the guard, so this
+    /// does not reopen the hole that deleting `spi()` closed.
     pub async fn with_bus<R>(
         &self,
         f: impl FnOnce(&mut A::Bus, &mut A::Cs) -> R,
@@ -859,15 +835,9 @@ where
     /// (CS held across all 8 bytes — single-byte polls are unreliable
     /// on fast SPI hosts like ESP32-S3 GDMA) plus a 1 ms delay so
     /// shared-bus consumers (display flush) aren't starved.
-    /// Interleaving variant: takes the bus for ONE probe at a time.
-    ///
-    /// For waits measured in seconds — post-CMD38 above all. Holding across
-    /// those would freeze the display for the whole format, which is the thing
-    /// a format must never do. Acquiring per probe means the display is
-    /// guaranteed the bus between any two probes, and the fair arbiter bounds
-    /// how long the probe then waits to get it back.
-    ///
-    /// The caller must NOT hold a guard when calling this.
+    /// Interleaving variant: one probe per acquire, for second-scale waits
+    /// (post-CMD38). Holding across those would freeze the display for a whole
+    /// format. Caller must NOT hold a guard.
     async fn wait_idle_reacquiring(&self, timeout_ms: u32, sustained_count: u32) -> Result<(), Error> {
         let target = sustained_count.max(1);
         let outer = with_timeout(self.delay.clone(), timeout_ms, async {
