@@ -1162,6 +1162,40 @@ mod response_tests {
 
     // ---- data error token (read) ------------------------------------------
 
+    // ---- CRC7 (command integrity) -----------------------------------------
+    //
+    // Init sends CMD59 with arg 1, which turns CRC CHECKING ON. From that point
+    // a command whose CRC7 is wrong is IGNORED BY THE CARD -- no R1, no error,
+    // just silence. So a CRC bug is indistinguishable from a dead card, and
+    // only shows up on cards that actually enforce it.
+
+    fn cmd_bytes(cmd: u8, arg: u32) -> [u8; 5] {
+        [0x40 | cmd, (arg >> 24) as u8, (arg >> 16) as u8, (arg >> 8) as u8, arg as u8]
+    }
+
+    #[test]
+    fn crc7_matches_the_spec_reference_vectors() {
+        // Values fixed by the SD Physical Layer spec / universally published
+        // reference frames; the trailing bit is the always-1 stop bit.
+        assert_eq!(crc7(&cmd_bytes(0, 0x0000_0000)), 0x95, "CMD0");
+        assert_eq!(crc7(&cmd_bytes(8, 0x0000_01AA)), 0x87, "CMD8");
+        assert_eq!(crc7(&cmd_bytes(55, 0x0000_0000)), 0x65, "CMD55");
+        assert_eq!(crc7(&cmd_bytes(41, 0x4000_0000)), 0x77, "ACMD41 HCS=1");
+        assert_eq!(crc7(&cmd_bytes(58, 0x0000_0000)), 0xFD, "CMD58");
+    }
+
+    #[test]
+    fn crc7_always_sets_the_stop_bit() {
+        for cmd in 0..=63u8 {
+            assert_eq!(crc7(&cmd_bytes(cmd, 0)) & 1, 1, "CMD{cmd} stop bit");
+        }
+    }
+
+    #[test]
+    fn crc7_changes_with_the_argument() {
+        assert_ne!(crc7(&cmd_bytes(17, 0)), crc7(&cmd_bytes(17, 1)));
+    }
+
     #[test]
     fn data_error_token_bits_decode() {
         assert_eq!(DataErrorToken(0x01).to_error(), Some(Error::ReadError));
