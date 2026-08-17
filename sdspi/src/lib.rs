@@ -212,6 +212,20 @@ pub enum Error {
     EraseError,
 }
 
+/// Stretch a wall-clock bound when the program is being interpreted.
+///
+/// Every timeout in this driver measures real time, which stops being a
+/// progress measure under Miri (~100x slower): a perfectly healthy wait
+/// overruns and the operation is reported as a fault. The block layer already
+/// scales its backstops for this reason; these are the driver-side twins.
+///
+/// Most visible on the post-CMD38 sustained-idle wait, which needs 2000 probes
+/// at 1 ms each -- 2 s natively, ~200 s interpreted, against a 60 s bound.
+#[inline]
+const fn wall(ms: u32) -> u32 {
+    if cfg!(miri) { ms.saturating_mul(100) } else { ms }
+}
+
 /// Must be called between powerup and [SdSpi::init] to ensure the sdcard is properly initialized.
 pub async fn sd_init<SPI, CS, BE>(spi: &mut SPI, cs: &mut CS) -> Result<(), Error>
 where
@@ -300,7 +314,7 @@ where
     /// acquiring: a card still programming a previous write must not pin the
     /// bus, or the block layer's backstop is spent waiting for it.
     async fn settle(&self) -> Result<(), Error> {
-        self.wait_idle_reacquiring(10_000, 1).await
+        self.wait_idle_reacquiring(wall(10_000), 1).await
     }
 
     /// Take the bus for one command, or fail the command.
@@ -340,7 +354,7 @@ where
         let (spi, cs) = _guard.split();
         cs.set_low().map_err(|_| Error::ChipSelect)?;
         let r = async {
-            with_timeout(self.delay.clone(), 1000, async {
+            with_timeout(self.delay.clone(), wall(1000), async {
                 loop {
                     let r = self.cmd(spi, idle()).await?;
                     if r == R1_IDLE_STATE {
@@ -369,7 +383,7 @@ where
                 return Err(Error::Cmd59Error);
             }
 
-            with_timeout(self.delay.clone(), 1000, async {
+            with_timeout(self.delay.clone(), wall(1000), async {
                 loop {
                     // CMD8 is the version probe: a v1 card ILLEGALLY-COMMANDs
                     // it, which identifies the card rather than being a fault.
@@ -396,7 +410,7 @@ where
             let mut card = Card::default();
 
             // send ACMD41
-            with_timeout(self.delay.clone(), 1000, async {
+            with_timeout(self.delay.clone(), wall(1000), async {
                 loop {
                     let r = self.acmd(spi, sd_send_op_cond(true, false, true, 0x20)).await?;
                     if r == R1_READY_STATE {
@@ -410,7 +424,7 @@ where
             .await??;
 
             trace!("send_ocr");
-            card.ocr = with_timeout(self.delay.clone(), 1000, async {
+            card.ocr = with_timeout(self.delay.clone(), wall(1000), async {
                 loop {
                     let r = self.cmd(spi, cmd::<R3>(0x3A, 0)).await?;
                     if r != R1_READY_STATE {
@@ -552,7 +566,7 @@ where
             // Guard dropped: the card ACKed with DATA_RES_ACCEPTED and is now
             // running its program cycle. Wait it out with the bus RELEASED,
             // re-acquiring per probe, so the display is served throughout.
-            self.wait_idle_reacquiring(10_000, 1).await?;
+            self.wait_idle_reacquiring(wall(10_000), 1).await?;
         }
 
         Ok(())
@@ -611,7 +625,7 @@ where
         // puts no fixed upper bound on full-card CMD38 (a function of capacity
         // x per-AU erase time). Re-acquires per probe, so the display renders
         // format progress throughout.
-        self.wait_idle_reacquiring(60_000, 1).await?;
+        self.wait_idle_reacquiring(wall(60_000), 1).await?;
 
         // Post-CMD38 sustained-idle. A card can show a brief FALSE idle right
         // after CMD38 — MISO goes 0xFF transiently while it is still doing
@@ -630,7 +644,7 @@ where
         // sustained_count = 2 000 (~2 s of continuous idle): 200 ms exits OK
         // but the next command still finds the card busy. Fast cards reach it
         // promptly — any 0x00 byte resets the counter.
-        self.wait_idle_reacquiring(60_000, 2_000).await?;
+        self.wait_idle_reacquiring(wall(60_000), 2_000).await?;
 
         Ok(())
     }
@@ -655,7 +669,7 @@ where
         let window: &mut [u8; WINDOW] =
             unsafe { &mut *(window_word.as_mut_ptr() as *mut [u8; WINDOW]) };
 
-        let found = with_timeout(self.delay.clone(), 1000, async {
+        let found = with_timeout(self.delay.clone(), wall(1000), async {
             loop {
                 window.fill(0xFF);
                 spi.transfer_in_place(&mut window[..]).await.map_err(|_| Error::SpiError)?;
@@ -886,7 +900,7 @@ where
         // report nothing.
         const NCR_GRACE_MS: u32 = 200;
         let mut polls: u32 = 1;
-        let outer = with_timeout(self.delay.clone(), NCR_GRACE_MS, async {
+        let outer = with_timeout(self.delay.clone(), wall(NCR_GRACE_MS), async {
             loop {
                 let byte = self.read_byte(spi).await?;
                 polls += 1;
