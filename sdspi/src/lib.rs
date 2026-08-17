@@ -1,6 +1,8 @@
 //! A crate for interfacing with SD cards over SPI.
 
-#![no_std]
+// `no_std` on target; std under `cargo test` so the response decoders below
+// can be unit-tested on the host without hardware.
+#![cfg_attr(not(test), no_std)]
 
 use block_device_driver::DmaBlock;
 use core::fmt::Debug;
@@ -52,10 +54,125 @@ impl Card {
     }
 }
 
+/// R1 status byte, decoded (SD Physical Layer spec v9.00, 7.3.2.1).
+///
+/// Bit 7 is always 0 on a valid R1; the rest are sticky error flags that the
+/// card clears on the next command. Every one of them is checked -- an R1 that
+/// is merely "not the value we hoped for" hides which fault occurred.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct R1Status(pub u8);
+
+impl R1Status {
+    pub const IDLE: u8 = 0x01;
+    pub const ERASE_RESET: u8 = 0x02;
+    pub const ILLEGAL_COMMAND: u8 = 0x04;
+    pub const COM_CRC_ERROR: u8 = 0x08;
+    pub const ERASE_SEQUENCE_ERROR: u8 = 0x10;
+    pub const ADDRESS_ERROR: u8 = 0x20;
+    pub const PARAMETER_ERROR: u8 = 0x40;
+    /// Every bit that reports a fault (i.e. all but `IDLE`).
+    pub const ERROR_MASK: u8 = 0x7E;
+
+    pub fn is_valid(self) -> bool { self.0 & 0x80 == 0 }
+    pub fn idle(self) -> bool { self.0 & Self::IDLE != 0 }
+    pub fn ready(self) -> bool { self.0 == 0 }
+    pub fn errors(self) -> u8 { self.0 & Self::ERROR_MASK }
+
+    /// The first fault the card reports, most severe first, or `None`.
+    ///
+    /// Order matters: a CRC error means the command never took effect, so it is
+    /// reported ahead of consequences like ADDRESS_ERROR.
+    pub fn to_error(self) -> Option<Error> {
+        if !self.is_valid() {
+            return Some(Error::NoResponse);
+        }
+        if self.0 & Self::COM_CRC_ERROR != 0 { return Some(Error::CommandCrcError); }
+        if self.0 & Self::ILLEGAL_COMMAND != 0 { return Some(Error::IllegalCommand); }
+        if self.0 & Self::PARAMETER_ERROR != 0 { return Some(Error::ParameterError); }
+        if self.0 & Self::ADDRESS_ERROR != 0 { return Some(Error::AddressError); }
+        if self.0 & Self::ERASE_SEQUENCE_ERROR != 0 { return Some(Error::EraseSequenceError); }
+        if self.0 & Self::ERASE_RESET != 0 { return Some(Error::EraseReset); }
+        None
+    }
+}
+
+/// Data-response token returned after a write block (spec 7.3.3.1).
+/// Format `xxx0sss1`; only the three `sss` bits carry meaning.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct DataResponse(pub u8);
+
+impl DataResponse {
+    pub fn status(self) -> u8 { self.0 & DATA_RES_MASK }
+    pub fn accepted(self) -> bool { self.status() == DATA_RES_ACCEPTED }
+
+    pub fn to_error(self) -> Option<Error> {
+        match self.status() {
+            DATA_RES_ACCEPTED => None,
+            0x0B => Some(Error::DataCrcError),
+            0x0D => Some(Error::DataWriteError),
+            other => Some(Error::UnknownDataResponse(other)),
+        }
+    }
+}
+
+/// Data-error token, sent instead of a data-start token when the card cannot
+/// deliver a block (spec 7.3.3.3). High nibble is zero; low bits are flags.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct DataErrorToken(pub u8);
+
+impl DataErrorToken {
+    /// A token is an error token only if the top four bits are clear.
+    pub fn is_error_token(self) -> bool { self.0 & 0xF0 == 0 && self.0 != 0 }
+
+    pub fn to_error(self) -> Option<Error> {
+        if !self.is_error_token() { return None; }
+        if self.0 & 0x08 != 0 { return Some(Error::OutOfRange); }
+        if self.0 & 0x04 != 0 { return Some(Error::CardEccFailed); }
+        if self.0 & 0x02 != 0 { return Some(Error::CardControllerError); }
+        Some(Error::ReadError)
+    }
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[non_exhaustive]
 pub enum Error {
+    /// No R1 arrived inside the spec's NCR window and the fallback poll.
+    /// Carries the command index, because "some command went unanswered" is
+    /// not actionable — CMD0 silent means no card, ACMD41 silent means the
+    /// card stopped answering partway through init.
+    NoResponseTo(u8),
+    /// An R1 was read but bit 7 was set, so it was not an R1 at all.
+    NoResponse,
+    /// R1: the command's CRC was wrong, so the card ignored it.
+    CommandCrcError,
+    /// R1: command not legal for the current card state.
+    IllegalCommand,
+    /// R1: argument out of the allowed range.
+    ParameterError,
+    /// R1: misaligned address for the block length.
+    AddressError,
+    /// R1: erase sequence broken (e.g. CMD32/33/38 out of order).
+    EraseSequenceError,
+    /// R1: an erase sequence was cleared before it ran.
+    EraseReset,
+    /// Write rejected: the card saw a CRC error in the data block.
+    DataCrcError,
+    /// Write rejected: an internal write error.
+    DataWriteError,
+    /// Data response token outside the values the spec defines.
+    UnknownDataResponse(u8),
+    /// Read failed: generic error token.
+    ReadError,
+    /// Read failed: internal card controller error.
+    CardControllerError,
+    /// Read failed: ECC could not correct the data.
+    CardEccFailed,
+    /// Read failed: address out of range.
+    OutOfRange,
     /// The arbiter would not hand over the bus. The command fails rather than
     /// running unlocked — an unlocked command is how a display flush clocks the
     /// card's payload away.
@@ -200,17 +317,10 @@ where
         // token wait, which is what no fixed `transaction()` could express.
         let (spi, cs) = _guard.split();
         cs.set_low().map_err(|_| Error::ChipSelect)?;
-        // What CMD0 actually answers, reported once if the loop gives up. All
-        // 0xFF means MISO never went low: the card is not driving the line at
-        // all (not selected, unpowered, or the pad is not routed to MISO) —
-        // a different fault from a card answering with the wrong R1. Without
-        // it the failure is an undifferentiated `Timeout`.
-        let last_r1 = core::sync::atomic::AtomicU32::new(0x1_0000);
         let r = async {
             with_timeout(self.delay.clone(), 1000, async {
                 loop {
                     let r = self.cmd(spi, idle()).await?;
-                    last_r1.store(r as u32, core::sync::atomic::Ordering::Relaxed);
                     if r == R1_IDLE_STATE {
                         return Ok(());
                     }
@@ -233,15 +343,24 @@ where
 
             // "The SPI interface is initialized in the CRC OFF mode in default"
             // -- SD Part 1 Physical Layer Specification v9.00, Section 7.2.2 Bus Transfer Protection
-            if self.cmd(spi, cmd::<R1>(0x3B, 1)).await? != R1_IDLE_STATE {
-                return Err(Error::Cmd59Error);
+            match self.cmd(spi, cmd::<R1>(0x3B, 1)).await {
+                Ok(r) if r == R1_IDLE_STATE => {}
+                // A card that refuses CRC-off, or answers from the wrong state,
+                // is reported as the CMD59 failure it is.
+                Ok(_) | Err(Error::IllegalCommand) => return Err(Error::Cmd59Error),
+                Err(e) => return Err(e),
             }
 
             with_timeout(self.delay.clone(), 1000, async {
                 loop {
-                    let r = self.cmd(spi, send_if_cond(0x1, 0xAA)).await?;
-                    if r == (R1_ILLEGAL_COMMAND | R1_IDLE_STATE) {
-                        return Err(Error::UnsupportedCard);
+                    // CMD8 is the version probe: a v1 card ILLEGALLY-COMMANDs
+                    // it, which identifies the card rather than being a fault.
+                    // `cmd()` now surfaces that bit as an error, so catch it
+                    // here instead of comparing raw bytes.
+                    match self.cmd(spi, send_if_cond(0x1, 0xAA)).await {
+                        Ok(_) => {}
+                        Err(Error::IllegalCommand) => return Err(Error::UnsupportedCard),
+                        Err(e) => return Err(e),
                     }
                     let mut buffer = [0xFFu8; 4];
                     spi.transfer_in_place(&mut buffer[..]).await.map_err(|_| Error::SpiError)?;
@@ -318,6 +437,11 @@ where
         }
         .await;
 
+        // Say WHAT the card answered when init fails. 0xFF every poll means
+        // MISO never went low -- the card is not driving the line at all
+        // (unselected, unpowered, or the pad is not routed to MISO), which is
+        // a different fault from a card answering with an unexpected R1. A
+        // bare `Timeout` cannot tell those apart.
         let card = r?;
         drop(_guard);
         self.card = Some(card);
@@ -537,6 +661,15 @@ where
 
         let token = window[i];
         if token != DATA_START_BLOCK {
+            // A card that cannot deliver the block sends a data ERROR token
+            // (high nibble clear) in place of the start token. Decode it --
+            // reporting the raw byte as `RegisterError` threw away which of
+            // out-of-range / ECC / controller error the card actually reported.
+            if let Some(e) = DataErrorToken(token).to_error() {
+                error!("sdspi::read_data error token 0x{:02x}: {:?}", token, e);
+                return Err(e);
+            }
+            error!("sdspi::read_data unexpected token 0x{:02x}", token);
             return Err(Error::RegisterError(token));
         }
 
@@ -594,17 +727,14 @@ where
 
         for &b in &*status_buf {
             if b != 0xFF {
-                if (b & DATA_RES_MASK) != DATA_RES_ACCEPTED {
-                    error!(
-                        "sdspi: write_data rejected, status=0x{:02x} ({})",
-                        b,
-                        match b & DATA_RES_MASK {
-                            0x0B => "CRC error",
-                            0x0D => "write/program error",
-                            _ => "unknown",
-                        }
-                    );
-                    return Err(Error::WriteError);
+                let response = DataResponse(b);
+                if let Some(e) = response.to_error() {
+                    // Return WHICH rejection, not a blanket WriteError: a CRC
+                    // error means the data never landed and the block is
+                    // retryable, a write error means the card failed to program
+                    // it. Callers cannot tell those apart from one variant.
+                    error!("sdspi::write_data rejected, status=0x{:02x}: {:?}", b, e);
+                    return Err(e);
                 }
                 return Ok(());
             }
@@ -713,8 +843,18 @@ where
         // poll with CS toggle is unreliable on fast hosts but a
         // compliant card cannot reach here, so the fallback is just
         // for graceful degradation on misbehaving cards.
+        // Grace for a card that missed the NCR window, bounded WELL below the
+        // callers' budgets. The spec puts NCR at 0-8 bytes -- 160 us at 400 kHz
+        // -- so a card still silent after 200 ms is not "slow", it is not
+        // answering. At 10 s this bound could never fire: every init loop wraps
+        // cmd() in 1 s, so the outer timeout always won and the failure arrived
+        // as an opaque `Timeout` with no idea which command or why. Same
+        // ordering rule as the block layer's backstop: an inner bound that
+        // exceeds its caller's budget is unreachable, and unreachable bounds
+        // report nothing.
+        const NCR_GRACE_MS: u32 = 200;
         let mut polls: u32 = 1;
-        let outer = with_timeout(self.delay.clone(), 10_000, async {
+        let outer = with_timeout(self.delay.clone(), NCR_GRACE_MS, async {
             loop {
                 let byte = self.read_byte(spi).await?;
                 polls += 1;
@@ -737,11 +877,22 @@ where
         .await;
         if let Err(Error::Timeout) = outer {
             error!(
-                "sdspi: cmd {} response wait timed out after 10 s ({} polls)",
-                cmd.cmd, polls
+                "sdspi: cmd {} got no R1 within {} ms ({} polls)",
+                cmd.cmd, NCR_GRACE_MS, polls
             );
+            // NOT `Timeout`: the card never answered at all, which is a
+            // different fault from an operation that ran too long.
+            return Err(Error::NoResponseTo(cmd.cmd));
         }
         let byte = outer??;
+
+        // Every R1 error bit is a fault the card is reporting; returning the
+        // raw byte let callers compare against the one value they expected and
+        // silently ignore the rest.
+        if let Some(e) = R1Status(byte).to_error() {
+            error!("sdspi: cmd {} R1=0x{:02x}: {:?}", cmd.cmd, byte, e);
+            return Err(e);
+        }
 
         Ok(byte)
     }
@@ -914,4 +1065,137 @@ fn crc16(data: &[u8]) -> u16 {
         crc ^= (crc & 0xFF) << 5;
     }
     crc
+}
+
+
+#[cfg(test)]
+mod response_tests {
+    use super::*;
+
+    // ---- R1 ---------------------------------------------------------------
+
+    #[test]
+    fn r1_ready_and_idle_are_not_errors() {
+        assert!(R1Status(0x00).ready());
+        assert_eq!(R1Status(0x00).to_error(), None);
+        assert!(R1Status(0x01).idle());
+        assert!(!R1Status(0x01).ready());
+        assert_eq!(R1Status(0x01).to_error(), None, "idle alone is a state, not a fault");
+    }
+
+    #[test]
+    fn r1_with_bit7_set_is_not_a_response_at_all() {
+        assert!(!R1Status(0xFF).is_valid());
+        assert_eq!(R1Status(0xFF).to_error(), Some(Error::NoResponse));
+        assert!(!R1Status(0x80).is_valid());
+    }
+
+    #[test]
+    fn every_r1_error_bit_decodes_to_its_own_error() {
+        let cases = [
+            (R1Status::ERASE_RESET, Error::EraseReset),
+            (R1Status::ILLEGAL_COMMAND, Error::IllegalCommand),
+            (R1Status::COM_CRC_ERROR, Error::CommandCrcError),
+            (R1Status::ERASE_SEQUENCE_ERROR, Error::EraseSequenceError),
+            (R1Status::ADDRESS_ERROR, Error::AddressError),
+            (R1Status::PARAMETER_ERROR, Error::ParameterError),
+        ];
+        for (bit, want) in cases {
+            assert_eq!(R1Status(bit).to_error(), Some(want), "bit {bit:#04x}");
+            // Also set alongside IDLE, which is how a card reports during init.
+            assert_eq!(R1Status(bit | R1Status::IDLE).to_error(), Some(want),
+                       "bit {bit:#04x} with IDLE");
+        }
+    }
+
+    #[test]
+    fn no_error_bit_is_silently_ignored() {
+        // Every settable bit except IDLE must produce SOME error. A bit that
+        // decodes to None is a fault the driver would swallow.
+        for bit in 1..7 {
+            let raw = 1u8 << bit;
+            assert!(R1Status(raw).to_error().is_some(),
+                    "R1 bit {bit} ({raw:#04x}) decodes to no error");
+        }
+    }
+
+    #[test]
+    fn r1_reports_crc_ahead_of_its_consequences() {
+        // A bad CRC means the command never ran, so it outranks ADDRESS_ERROR.
+        let both = R1Status(R1Status::COM_CRC_ERROR | R1Status::ADDRESS_ERROR);
+        assert_eq!(both.to_error(), Some(Error::CommandCrcError));
+    }
+
+    #[test]
+    fn r1_errors_mask_excludes_idle() {
+        assert_eq!(R1Status(0x01).errors(), 0);
+        assert_eq!(R1Status(0x09).errors(), R1Status::COM_CRC_ERROR);
+    }
+
+    // ---- data response token (write) --------------------------------------
+
+    #[test]
+    fn data_response_accepted() {
+        // The spec fixes only bits 3..1; the surrounding bits are undefined.
+        for pad in [0x00u8, 0xE0, 0x20] {
+            let t = DataResponse(pad | DATA_RES_ACCEPTED);
+            assert!(t.accepted(), "pad {pad:#04x}");
+            assert_eq!(t.to_error(), None);
+        }
+    }
+
+    #[test]
+    fn data_response_crc_and_write_errors_decode() {
+        assert_eq!(DataResponse(0x0B).to_error(), Some(Error::DataCrcError));
+        assert_eq!(DataResponse(0x0D).to_error(), Some(Error::DataWriteError));
+        assert!(!DataResponse(0x0B).accepted());
+        assert!(!DataResponse(0x0D).accepted());
+    }
+
+    #[test]
+    fn undefined_data_response_is_reported_not_swallowed() {
+        match DataResponse(0x07).to_error() {
+            Some(Error::UnknownDataResponse(0x07)) => {}
+            other => panic!("undefined token must surface, got {other:?}"),
+        }
+    }
+
+    // ---- data error token (read) ------------------------------------------
+
+    #[test]
+    fn data_error_token_bits_decode() {
+        assert_eq!(DataErrorToken(0x01).to_error(), Some(Error::ReadError));
+        assert_eq!(DataErrorToken(0x02).to_error(), Some(Error::CardControllerError));
+        assert_eq!(DataErrorToken(0x04).to_error(), Some(Error::CardEccFailed));
+        assert_eq!(DataErrorToken(0x08).to_error(), Some(Error::OutOfRange));
+    }
+
+    #[test]
+    fn data_error_token_reports_the_most_specific_cause() {
+        // Bit 0 is set alongside the specific cause on real cards; the specific
+        // one must win, or every read failure looks identical.
+        assert_eq!(DataErrorToken(0x09).to_error(), Some(Error::OutOfRange));
+        assert_eq!(DataErrorToken(0x05).to_error(), Some(Error::CardEccFailed));
+        assert_eq!(DataErrorToken(0x03).to_error(), Some(Error::CardControllerError));
+    }
+
+    #[test]
+    fn data_start_token_is_not_mistaken_for_an_error_token() {
+        // 0xFE starts a data block and 0xFF is idle -- neither has a clear high
+        // nibble, so neither may decode as an error.
+        assert!(!DataErrorToken(DATA_START_BLOCK).is_error_token());
+        assert_eq!(DataErrorToken(DATA_START_BLOCK).to_error(), None);
+        assert!(!DataErrorToken(0xFF).is_error_token());
+        assert_eq!(DataErrorToken(0xFF).to_error(), None);
+        assert!(!DataErrorToken(0x00).is_error_token(), "all-zero is not a token");
+    }
+
+    #[test]
+    fn no_data_error_bit_is_silently_ignored() {
+        for bit in 0..4 {
+            let raw = 1u8 << bit;
+            assert!(DataErrorToken(raw).to_error().is_some(),
+                    "data error bit {bit} ({raw:#04x}) decodes to no error");
+        }
+    }
 }
