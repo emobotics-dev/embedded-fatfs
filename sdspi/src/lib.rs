@@ -236,7 +236,10 @@ where
     cs.set_high().map_err(|_| Error::ChipSelect)?;
     // Try flushing the card as done here: https://github.com/greiman/SdFat/blob/master/src/SdCard/SdSpiCard.cpp#L170,
     // https://github.com/rust-embedded-community/embedded-sdmmc-rs/pull/65#issuecomment-1270709448
-    spi.write(&[0xFF; 256]).await.map_err(|_| Error::SpiError)?;
+    // DRAM, not `&[0xFF; 256]`: a flash literal picks the copy path (§14).
+    let mut flush_words = [0xFFFF_FFFFu32; 64];
+    let flush: &mut [u8; 256] = unsafe { &mut *(flush_words.as_mut_ptr() as *mut [u8; 256]) };
+    spi.write(&flush[..]).await.map_err(|_| Error::SpiError)?;
 
     Ok(())
 }
@@ -251,6 +254,20 @@ where
 /// command/token-wait/payload cannot be interleaved. Released between commands
 /// and between busy probes, which is what lets the display share the bus.
 use embedded_hal_async::spi::SpiBus as _;
+
+/// Driver position, so a parked SD op is located rather than guessed at.
+/// Frozen [`PHASE`]+[`PHASE_SEQ`] = parked there; moving SEQ = looping.
+/// 10 acquire, 20 cmd, 30 read token, 40 payload, 60 idle probe, 0 none.
+pub static PHASE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// Bumped on every [`PHASE`] change. See [`PHASE`].
+pub static PHASE_SEQ: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+#[inline]
+fn phase(p: u32) {
+    PHASE.store(p, core::sync::atomic::Ordering::Relaxed);
+    PHASE_SEQ.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+}
+
 use embedded_hal::digital::OutputPin as _;
 
 pub trait BusAccess {
@@ -319,7 +336,10 @@ where
 
     /// Take the bus for one command, or fail the command.
     async fn lock(&self) -> Result<A::Guard<'_>, Error> {
-        self.bus.acquire().await.ok_or(Error::BusUnavailable)
+        phase(10);
+        let g = self.bus.acquire().await.ok_or(Error::BusUnavailable);
+        phase(0);
+        g
     }
 
     /// The arbiter, NOT the bus: callers can reach board-level settings (the
@@ -672,6 +692,7 @@ where
         let found = with_timeout(self.delay.clone(), wall(1000), async {
             loop {
                 window.fill(0xFF);
+                phase(30);
                 spi.transfer_in_place(&mut window[..]).await.map_err(|_| Error::SpiError)?;
                 if let Some(i) = window.iter().position(|&b| b != 0xFF) {
                     return Ok::<usize, Error>(i);
@@ -712,11 +733,14 @@ where
         let mut crc_bytes = [0xFFu8; 2];
         if carry < buffer.len() {
             buffer[carry..].fill(0xFF);
+            phase(40);
             spi.transfer_in_place(&mut buffer[carry..])
                 .await
                 .map_err(|_| Error::SpiError)?;
         }
+        phase(41);
         spi.transfer_in_place(&mut crc_bytes).await.map_err(|_| Error::SpiError)?;
+        phase(0);
         let crc = u16::from_be_bytes(crc_bytes);
         let calc_crc = crc16(buffer);
         if crc != calc_crc {
@@ -781,6 +805,19 @@ where
     // precisely what makes bus access representable without the lock, and one
     // caller using it would reintroduce the whole class silently.
 
+    /// Clock the N_RC gap: the spec's >=8 idle cycles between a response and
+    /// the next command. Commands that read exactly their payload leave none,
+    /// and a card that enforces it answers the next command with silence.
+    ///
+    /// From DRAM, never `write(&[0xFF])`: a promoted constant lives in flash,
+    /// which selects a copy path whose 1-byte transfer can hang holding the bus
+    /// (docs/spi-dma-and-wakeup.md §14). Four bytes keeps it 4-aligned for PDMA.
+    async fn clock_n_rc_gap(spi: &mut A::Bus) -> Result<(), Error> {
+        let mut gap = [0xFFFF_FFFFu32; 1];
+        let bytes: &mut [u8; 4] = unsafe { &mut *(gap.as_mut_ptr() as *mut [u8; 4]) };
+        spi.transfer_in_place(&mut bytes[..]).await.map_err(|_| Error::SpiError)
+    }
+
     async fn cmd<R: Resp>(&self, spi: &mut A::Bus, cmd: Cmd<R>) -> Result<u8, Error> {
         // No idle wait here. `settle()` did it before the lock was taken, and
         // repeating it inside means holding the bus for the card's programming
@@ -792,19 +829,8 @@ where
         // corrupt. That is why the old device-per-probe wait was safe, and why
         // moving it outside the lock loses nothing.
 
-        // N_RC: the SD spec requires at least 8 clock cycles between the end of
-        // a response and the start of the next command. Most commands got that
-        // for free -- their R1 is read in an 8-byte window, so up to 7 padding
-        // bytes of clocks follow. The commands in `has_trailing_bytes` do NOT:
-        // they read exactly R1 and then exactly the trailing payload, leaving
-        // no gap at all.
-        //
-        // A card that enforces N_RC then ignores the next command outright --
-        // no R1, no error, silence. That is what killed cores3 SD init: CMD0,
-        // CMD59 and CMD8 all succeeded, and CMD55 (issued straight after CMD8's
-        // 4-byte R7 read) was never answered. One byte of idle clocks here
-        // makes the gap unconditional instead of a side effect of padding.
-        spi.write(&[0xFF]).await.map_err(|_| Error::SpiError)?;
+        phase(20);
+        Self::clock_n_rc_gap(spi).await?;
 
         let mut buf = [
             0x40 | cmd.cmd,
@@ -864,7 +890,9 @@ where
                 .write(&buf)
                 .await
                 .map_err(|_| Error::SpiError)?;
+            phase(21);
             spi.transfer_in_place(&mut stuff).await.map_err(|_| Error::SpiError)?;
+            phase(22);
             spi.transfer_in_place(&mut response[..1]).await.map_err(|_| Error::SpiError)?;
         } else {
             let resp_len = if has_trailing_bytes { 1 } else { 8 };
@@ -872,6 +900,7 @@ where
                 .write(&buf)
                 .await
                 .map_err(|_| Error::SpiError)?;
+            phase(23);
             spi.transfer_in_place(&mut response[..resp_len])
                 .await
                 .map_err(|_| Error::SpiError)?;
@@ -997,10 +1026,12 @@ where
                     let mut probe_word = [0xFFFF_FFFFu32; 2];
                     let probe: &mut [u8; 8] =
                         unsafe { &mut *(probe_word.as_mut_ptr() as *mut [u8; 8]) };
+                    phase(60);
                     bus
                         .transfer_in_place(probe)
                         .await
                         .map_err(|_| Error::SpiError)?;
+                    phase(0);
                     probe.iter().all(|&b| b == 0xFF)
                     // guard dropped here — the display's turn
                 };
