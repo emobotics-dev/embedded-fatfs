@@ -516,35 +516,23 @@ where
         // format progress throughout.
         self.wait_idle_reacquiring(60_000, 1).await?;
 
-        // Post-CMD38 sustained-idle. Some host/card combinations show a
-        // brief false-idle right after CMD38 (MISO goes 0xFF transiently
-        // while the card is still doing post-erase housekeeping). Without
-        // a sustained check, the next CMD24 lands on a busy card whose
-        // R1 never arrives, and the format times out.
+        // Post-CMD38 sustained-idle. A card can show a brief FALSE idle right
+        // after CMD38 — MISO goes 0xFF transiently while it is still doing
+        // post-erase housekeeping. A single idle probe accepts that, and the
+        // next command then starts on a busy card, holds the bus for its whole
+        // duration waiting for a response that never comes, and dies on the
+        // caller's backstop.
         //
-        // FEATURE GATING: the cores3 + 16 GB SDHC card (ESP32-S3 GDMA)
-        // *requires* this guard — 0/10 format failure without it. fire27
-        // (ESP32 PDMA + shared-bus display + BLE controller) cannot
-        // tolerate the cumulative SPI-bus-mutex hold across thousands
-        // of probe transactions: the level-1 RWBLE interrupt gets
-        // masked for ms-scale windows, the BLE controller blob de-syncs,
-        // and the embassy executor eventually stops polling tasks
-        // (visible as LVGL FPS dropping to zero mid-format and the
-        // chip becoming unresponsive to all serial input). fire27's
-        // 8-byte NCR fast-path in `cmd()` is sufficient on its own.
+        // This was gated per target, on because cores3 failed 0/10 without it
+        // and off on fire27 because the wait used to HOLD the bus across
+        // thousands of probes (starving RWBLE). It re-acquires per probe now,
+        // so that objection is gone — and fire27 needed the guard all along:
+        // without it, format failed intermittently with the display starved
+        // (287 of 287 ms waiting for the bus) behind a stuck command. Ungated.
         //
-        // Targets opt in by enabling the `post-erase-sustained-idle`
-        // feature on the sdspi dependency. fire27 leaves it off; cores3
-        // enables it.
-        //
-        // sustained_count = 2 000 (≈ 2 s of confirmed continuous idle):
-        // empirically required for cores3 + 8 GB SDHC card combo
-        // (200 ms is insufficient — sustained exits OK but the next
-        // CMD24 still finds the card busy at the protocol level and
-        // times out at 10 s). Conservative; small fast cards exit
-        // promptly because any 0x00 byte in a probe resets the counter
-        // and they reach 2 s of idle quickly.
-        #[cfg(feature = "post-erase-sustained-idle")]
+        // sustained_count = 2 000 (~2 s of continuous idle): 200 ms exits OK
+        // but the next command still finds the card busy. Fast cards reach it
+        // promptly — any 0x00 byte resets the counter.
         self.wait_idle_reacquiring(60_000, 2_000).await?;
 
         Ok(())
@@ -840,10 +828,17 @@ where
     /// format. Caller must NOT hold a guard.
     async fn wait_idle_reacquiring(&self, timeout_ms: u32, sustained_count: u32) -> Result<(), Error> {
         let target = sustained_count.max(1);
+        // Probe counter, reported ONCE after the wait. The loop parks 1 ms, so
+        // probes ~= elapsed ms when the card is simply busy; far fewer probes
+        // than elapsed ms means the wait is starving on bus acquisition
+        // instead. Counting is a Cell store; logging per probe would change
+        // what it measures.
+        let probes = core::cell::Cell::new(0u32);
         let outer = with_timeout(self.delay.clone(), timeout_ms, async {
             let mut consec: u32 = 0;
             loop {
                 let idle = {
+                    probes.set(probes.get() + 1);
                     let mut guard = self.bus.acquire().await.ok_or(Error::BusUnavailable)?;
                     let (bus, cs) = guard.split();
                     cs.set_low().map_err(|_| Error::ChipSelect)?;
@@ -871,6 +866,14 @@ where
             }
         })
         .await;
+        if probes.get() > 1_000 {
+            debug!(
+                "sdspi: idle wait ended after {} probes (bound {} ms, target {})",
+                probes.get(),
+                timeout_ms,
+                target
+            );
+        }
         outer?
     }
 
