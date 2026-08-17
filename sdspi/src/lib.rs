@@ -396,10 +396,12 @@ where
                     error!("sdspi::write[single] write_data @ {}: {:?}", block_address, e);
                     e
                 })?;
-                self.wait_idle(spi).await.map_err(|e| {
-                    error!("sdspi::write[single] wait_idle @ {}: {:?}", block_address, e);
-                    e
-                })?;
+                // No idle wait here: the card ACKed with DATA_RES_ACCEPTED, so
+                // the transaction is over and what remains is its internal
+                // program cycle. Waiting for that under the guard held the bus
+                // for the whole cycle — display starved, and the caller's
+                // backstop fired on a healthy write. It is waited out below,
+                // after the guard drops.
                 // NOTE: write[multi] has no analogous CMD13 (sd_status)
                 // post-check, and a CMD13 here on fast SPI hosts
                 // (ESP32-S3 GDMA observed) intermittently times out
@@ -457,6 +459,13 @@ where
         .await;
 
         r?;
+
+        // The card is still running its internal program cycle. Release the bus
+        // FIRST, then confirm it finished, re-acquiring per probe. Waiting under
+        // the guard starved the display for the whole cycle and tripped the
+        // caller's backstop on a perfectly healthy write.
+        drop(_guard);
+        self.wait_idle_reacquiring(10_000, 1).await?;
 
         Ok(())
     }
