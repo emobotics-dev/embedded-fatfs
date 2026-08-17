@@ -6,7 +6,6 @@ use block_device_driver::DmaBlock;
 use core::fmt::Debug;
 use core::future::Future;
 use embassy_futures::select::{select, Either};
-use embassy_futures::yield_now;
 use sdio_host::sd::{CardCapacity, CID, CSD, OCR, SD};
 use sdio_host::{common_cmd::*, sd_cmd::*};
 
@@ -169,9 +168,47 @@ where
         }
     }
 
+    /// Wait for the card to finish whatever it is doing, WITHOUT holding the
+    /// bus.
+    ///
+    /// Called before acquiring, so a card still programming a previous write
+    /// does not pin the bus — the display gets it between probes, and the block
+    /// layer's per-op backstop is not spent waiting for the card.
+    async fn settle(&self) -> Result<(), Error> {
+        self.wait_idle_reacquiring(10_000, 1).await
+    }
+
     /// Take the bus for one command, or fail the command.
     async fn lock(&self) -> Result<A::Guard<'_>, Error> {
         self.bus.acquire().await.ok_or(Error::BusUnavailable)
+    }
+
+    /// The arbiter this driver reaches the bus through.
+    ///
+    /// Hands out the ARBITER, not the bus: callers can ask it for board-level
+    /// settings (the post-init SD clock, say) without gaining a way to talk to
+    /// the card outside a guard. That distinction is the whole point of the
+    /// type — `spi()` used to return the device itself and had to be deleted.
+    pub fn bus(&self) -> &A {
+        &self.bus
+    }
+
+    /// Run `f` against the bus and chip-select, with the bus held.
+    ///
+    /// For things that are neither a command nor optional — raising the SD
+    /// clock once the card has answered, above all. That has to happen under
+    /// the guard like everything else, and it cannot go through a per-device
+    /// config any more because the driver drives the bus directly.
+    ///
+    /// The references cannot outlive the guard, so this does not reopen the
+    /// unlocked-access hole that deleting `spi()` closed.
+    pub async fn with_bus<R>(
+        &self,
+        f: impl FnOnce(&mut A::Bus, &mut A::Cs) -> R,
+    ) -> Result<R, Error> {
+        let mut guard = self.lock().await?;
+        let (bus, cs) = guard.split();
+        Ok(f(bus, cs))
     }
 
     /// To comply with the SD card spec, [sd_init] must be called between powerup and calling this function.
@@ -179,6 +216,7 @@ where
         // One lock for the WHOLE command: the card sees command, token wait and
         // payload with no other master able to interleave. Released on return,
         // so the next command and the display both get their turn.
+        self.settle().await?;
         let mut _guard = self.lock().await?;
         // CS low for the WHOLE command, released after the last operation. This
         // is the guard: the individual transfers below no longer touch CS, so
@@ -311,6 +349,7 @@ where
         // One lock for the WHOLE command: the card sees command, token wait and
         // payload with no other master able to interleave. Released on return,
         // so the next command and the display both get their turn.
+        self.settle().await?;
         let mut _guard = self.lock().await?;
         // CS low for the WHOLE command, released after the last operation. This
         // is the guard: the individual transfers below no longer touch CS, so
@@ -362,6 +401,7 @@ where
         // One lock for the WHOLE command: the card sees command, token wait and
         // payload with no other master able to interleave. Released on return,
         // so the next command and the display both get their turn.
+        self.settle().await?;
         let mut _guard = self.lock().await?;
         // CS low for the WHOLE command, released after the last operation. This
         // is the guard: the individual transfers below no longer touch CS, so
@@ -465,6 +505,7 @@ where
         // a full-card erase takes seconds, and holding across it would freeze
         // the display for the whole format. That wait re-acquires per probe.
         {
+        self.settle().await?;
         let mut _guard = self.lock().await?;
         // CS low for the WHOLE command, released after the last operation. This
         // is the guard: the individual transfers below no longer touch CS, so
@@ -534,35 +575,63 @@ where
     }
 
     async fn read_data(&self, spi: &mut A::Bus, buffer: &mut [u8]) -> Result<(), Error> {
-        // Same rationale as `wait_idle` — yield between polls while
-        // waiting for the data-start token so other async tasks on
-        // the same executor are not starved.
-        let outer = with_timeout(self.delay.clone(), 1000, async {
-            let mut byte = self.read_byte(spi).await?;
-            while byte == 0xFF {
-                yield_now().await;
-                byte = self.read_byte(spi).await?;
+        // Poll for the 0xFE data-start token EIGHT bytes at a time.
+        //
+        // The polling itself is the protocol -- SD SPI has no ready signal, the
+        // card returns 0xFF until it emits the token, and the host only sees it
+        // by clocking. What is NOT required is clocking one byte per poll: the
+        // card holds the token until read, so a wider window costs nothing and
+        // cuts the number of transfers, and of yields, by 8x. `write_data`
+        // already uses this trick for its data-response window.
+        //
+        // Bytes AFTER the token in the winning window are the first payload
+        // bytes -- the card is already streaming. They are carried into the
+        // buffer rather than discarded, which is what makes this correct rather
+        // than merely faster.
+        const WINDOW: usize = 8;
+        // 4-aligned backing: ESP32 PDMA needs it (see the wait_idle probe).
+        let mut window_word = [0xFFFF_FFFFu32; 2];
+        let window: &mut [u8; WINDOW] =
+            unsafe { &mut *(window_word.as_mut_ptr() as *mut [u8; WINDOW]) };
+
+        let found = with_timeout(self.delay.clone(), 1000, async {
+            loop {
+                window.fill(0xFF);
+                spi.transfer_in_place(&mut window[..]).await.map_err(|_| Error::SpiError)?;
+                if let Some(i) = window.iter().position(|&b| b != 0xFF) {
+                    return Ok::<usize, Error>(i);
+                }
+                // Short park, not `yield_now`: on fire27 a self-wake re-pends
+                // the level-1 SWI and the level-0 thread-mode executor -- which
+                // hosts the BLE blob -- never runs. 1 ms was measurably too
+                // coarse (3/3 format failures against the block layer's 3 s
+                // backstop); 100 us keeps block ops well inside it while still
+                // handing the core back.
+                self.delay.clone().delay_us(100).await;
             }
-            Ok(byte)
         })
         .await;
-        if let Err(Error::Timeout) = outer {
+        if let Err(Error::Timeout) = found {
             error!("sdspi: read_data data-start token wait timed out after 1000 ms");
         }
-        let r = outer??;
+        let i = found??;
 
-        if r != DATA_START_BLOCK {
-            return Err(Error::RegisterError(r));
+        let token = window[i];
+        if token != DATA_START_BLOCK {
+            return Err(Error::RegisterError(token));
         }
 
-        // Read data block + 2 CRC bytes in one SpiDevice transaction
-        // so CS stays asserted for the entire data phase.
-        buffer.fill(0xFF);
+        // Carry the payload bytes that shared the token's window.
+        let carry = core::cmp::min(WINDOW - (i + 1), buffer.len());
+        buffer[..carry].copy_from_slice(&window[i + 1..i + 1 + carry]);
+
         let mut crc_bytes = [0xFFu8; 2];
-        spi
-            .transfer_in_place(buffer)
-            .await
-            .map_err(|_| Error::SpiError)?;
+        if carry < buffer.len() {
+            buffer[carry..].fill(0xFF);
+            spi.transfer_in_place(&mut buffer[carry..])
+                .await
+                .map_err(|_| Error::SpiError)?;
+        }
         spi.transfer_in_place(&mut crc_bytes).await.map_err(|_| Error::SpiError)?;
         let crc = u16::from_be_bytes(crc_bytes);
         let calc_crc = crc16(buffer);
@@ -632,9 +701,15 @@ where
     // caller using it would reintroduce the whole class silently.
 
     async fn cmd<R: Resp>(&self, spi: &mut A::Bus, cmd: Cmd<R>) -> Result<u8, Error> {
-        if cmd.cmd != idle().cmd {
-            self.wait_idle(spi).await?;
-        }
+        // No idle wait here. `settle()` did it before the lock was taken, and
+        // repeating it inside means holding the bus for the card's programming
+        // time -- which is what spent the block layer's 3 s backstop and
+        // reported as "Write STALL, card state unknown".
+        //
+        // CS continuity is needed for the DATA phase (command -> token ->
+        // payload), not for busy polling: a busy wait has no data phase to
+        // corrupt. That is why the old device-per-probe wait was safe, and why
+        // moving it outside the lock loses nothing.
 
         let mut buf = [
             0x40 | cmd.cmd,
