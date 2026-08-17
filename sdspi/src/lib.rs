@@ -322,49 +322,41 @@ where
         block_address: u32,
         data: &mut [DmaBlock<SIZE>],
     ) -> Result<(), Error> {
-        // One lock for the WHOLE command: the card sees command, token wait and
-        // payload with no other master able to interleave. Released on return,
-        // so the next command and the display both get their turn.
-        self.settle().await?;
-        let mut _guard = self.lock().await?;
-        // CS low for the WHOLE command, released after the last operation. This
-        // is the guard: the individual transfers below no longer touch CS, so
-        // it cannot rise mid-command — not even across the unbounded 0xFE
-        // token wait, which is what no fixed `transaction()` could express.
-        let (spi, cs) = _guard.split();
-        cs.set_low().map_err(|_| Error::ChipSelect)?;
-        let n = data.len();
-        let r = async {
-            if n == 1 {
-                self.cmd(spi, read_single_block(block_address)).await.map_err(|e| {
-                    error!("sdspi::read[single] CMD17 @ {}: {:?}", block_address, e);
+        // ONE BLOCK PER LOCK, never CMD18.
+        //
+        // CS has to stay low for a whole command, so a multi-block read holds
+        // the bus across EVERY block's data-token wait — up to 16 of them, each
+        // bounded at 1 s. That is seconds of exclusive bus on a card that is
+        // slow to answer, with the display starved behind it (measured: 282 of
+        // 282 ms of a panel transfer spent waiting for the permit) and the
+        // caller's backstop firing on work that was going to succeed.
+        //
+        // Single-block commands bound the hold to one block and free the bus
+        // between them. Costs one command per block; the alternative is an
+        // unbounded shared-bus hold, which no outer timeout can fix (#46).
+        for (i, block) in data.iter_mut().enumerate() {
+            let addr = block_address + i as u32;
+            self.settle().await?;
+            let mut guard = self.lock().await?;
+            // CS low for the whole command: the transfers below never touch it,
+            // so it cannot rise mid-command — not across the token wait either,
+            // which is what no fixed `transaction()` could express.
+            let (spi, cs) = guard.split();
+            cs.set_low().map_err(|_| Error::ChipSelect)?;
+            let r = async {
+                self.cmd(spi, read_single_block(addr)).await.map_err(|e| {
+                    error!("sdspi::read CMD17 @ {}: {:?}", addr, e);
                     e
                 })?;
-                self.read_data(spi, &mut data[0][..]).await.map_err(|e| {
-                    error!("sdspi::read[single] read_data @ {}: {:?}", block_address, e);
+                self.read_data(spi, &mut block[..]).await.map_err(|e| {
+                    error!("sdspi::read read_data @ {}: {:?}", addr, e);
                     e
                 })?;
-            } else {
-                self.cmd(spi, read_multiple_blocks(block_address)).await.map_err(|e| {
-                    error!("sdspi::read[multi] CMD18 @ {} n={}: {:?}", block_address, n, e);
-                    e
-                })?;
-                for (i, block) in data.iter_mut().enumerate() {
-                    self.read_data(spi, &mut block[..]).await.map_err(|e| {
-                        error!("sdspi::read[multi] read_data block {} @ {}: {:?}", i, block_address, e);
-                        e
-                    })?;
-                }
-                self.cmd(spi, stop_transmission()).await.map_err(|e| {
-                    error!("sdspi::read[multi] CMD12 @ {}: {:?}", block_address, e);
-                    e
-                })?;
+                Ok::<(), Error>(())
             }
-            Ok(())
+            .await;
+            r?;
         }
-        .await;
-
-        r?;
 
         Ok(())
     }
@@ -374,98 +366,38 @@ where
         block_address: u32,
         data: &[DmaBlock<SIZE>],
     ) -> Result<(), Error> {
-        // One lock for the WHOLE command: the card sees command, token wait and
-        // payload with no other master able to interleave. Released on return,
-        // so the next command and the display both get their turn.
-        self.settle().await?;
-        let mut _guard = self.lock().await?;
-        // CS low for the WHOLE command, released after the last operation. This
-        // is the guard: the individual transfers below no longer touch CS, so
-        // it cannot rise mid-command — not even across the unbounded 0xFE
-        // token wait, which is what no fixed `transaction()` could express.
-        let (spi, cs) = _guard.split();
-        cs.set_low().map_err(|_| Error::ChipSelect)?;
-        let n = data.len();
-        let r = async {
-            if n == 1 {
-                self.cmd(spi, write_single_block(block_address)).await.map_err(|e| {
-                    error!("sdspi::write[single] CMD24 @ {}: {:?}", block_address, e);
-                    e
-                })?;
-                self.write_data(spi, DATA_START_BLOCK, &data[0][..]).await.map_err(|e| {
-                    error!("sdspi::write[single] write_data @ {}: {:?}", block_address, e);
-                    e
-                })?;
-                // No idle wait here: the card ACKed with DATA_RES_ACCEPTED, so
-                // the transaction is over and what remains is its internal
-                // program cycle. Waiting for that under the guard held the bus
-                // for the whole cycle — display starved, and the caller's
-                // backstop fired on a healthy write. It is waited out below,
-                // after the guard drops.
-                // NOTE: write[multi] has no analogous CMD13 (sd_status)
-                // post-check, and a CMD13 here on fast SPI hosts
-                // (ESP32-S3 GDMA observed) intermittently times out
-                // with R1 not appearing in the NCR window after the
-                // card's programming cycle — symptom is identical to
-                // the CMD24-after-CMD38 issue but per-write. We rely
-                // on `write_data`'s DATA_RES_ACCEPTED response (host-
-                // side ACK) to detect write rejection; the additional
-                // card-side status check this CMD13 provided was
-                // never propagated meaningfully to upper layers.
-            } else {
-                // Try sending ACMD23 _before_ write.
-                // This will pre-erase blocks to improve write performance.
-                // We ignore the return value, because whether its accepted
-                // or not doesn't matter we will still proceed with the write
-                self.acmd(spi, cmd::<R1>(0x17, n as u32)).await.map_err(|e| {
-                    error!("sdspi::write[multi] ACMD23 @ {} n={}: {:?}", block_address, n, e);
-                    e
-                })?;
-                self.wait_idle(spi).await.map_err(|e| {
-                    error!("sdspi::write[multi] wait_idle post-ACMD23 @ {}: {:?}", block_address, e);
-                    e
-                })?;
-
-                let r1 = self.cmd(spi, write_multiple_blocks(block_address)).await.map_err(|e| {
-                    error!("sdspi::write[multi] CMD25 @ {} n={}: {:?}", block_address, n, e);
-                    e
-                })?;
-                if r1 != 0 {
-                    error!("sdspi::write[multi] CMD25 R1 nonzero @ {} n={}: 0x{:02x}", block_address, n, r1);
-                    return Err(Error::RegisterError(r1));
-                }
-                for (i, block) in data.iter().enumerate() {
-                    self.wait_idle(spi).await.map_err(|e| {
-                        error!("sdspi::write[multi] wait_idle pre-block {} @ {}: {:?}", i, block_address, e);
+        // ONE BLOCK PER LOCK, never CMD25 — same reasoning as `read`, and worse
+        // here: a multi-block write holds the bus across every block's busy
+        // wait, each bounded at 10 s, so up to 16 program cycles back to back
+        // with CS pinned low. That is the hold no outer backstop can bound
+        // (#46). ACMD23 pre-erase goes with it; the format path already writes
+        // pre-erased.
+        for (i, block) in data.iter().enumerate() {
+            let addr = block_address + i as u32;
+            self.settle().await?;
+            {
+                let mut guard = self.lock().await?;
+                let (spi, cs) = guard.split();
+                cs.set_low().map_err(|_| Error::ChipSelect)?;
+                let r = async {
+                    self.cmd(spi, write_single_block(addr)).await.map_err(|e| {
+                        error!("sdspi::write CMD24 @ {}: {:?}", addr, e);
                         e
                     })?;
-                    self.write_data(spi, WRITE_MULTIPLE_TOKEN, &block[..]).await.map_err(|e| {
-                        error!("sdspi::write[multi] write_data block {} @ {}: {:?}", i, block_address, e);
+                    self.write_data(spi, DATA_START_BLOCK, &block[..]).await.map_err(|e| {
+                        error!("sdspi::write write_data @ {}: {:?}", addr, e);
                         e
                     })?;
+                    Ok::<(), Error>(())
                 }
-                // stop the write
-                self.wait_idle(spi).await.map_err(|e| {
-                    error!("sdspi::write[multi] wait_idle pre-STOP @ {}: {:?}", block_address, e);
-                    e
-                })?;
-                spi.write(&[STOP_TRAN_TOKEN]).await.map_err(|_| {
-                    error!("sdspi::write[multi] STOP_TRAN spi error @ {}", block_address);
-                    Error::SpiError
-                })?;
+                .await;
+                r?;
             }
-            Ok(())
+            // Guard dropped: the card ACKed with DATA_RES_ACCEPTED and is now
+            // running its program cycle. Wait it out with the bus RELEASED,
+            // re-acquiring per probe, so the display is served throughout.
+            self.wait_idle_reacquiring(10_000, 1).await?;
         }
-        .await;
-
-        r?;
-
-        // The card is still running its internal program cycle. Release the bus
-        // FIRST, then confirm it finished, re-acquiring per probe. Waiting under
-        // the guard starved the display for the whole cycle and tripped the
-        // caller's backstop on a perfectly healthy write.
-        drop(_guard);
-        self.wait_idle_reacquiring(10_000, 1).await?;
 
         Ok(())
     }
@@ -806,15 +738,6 @@ where
         self.cmd(spi, cmd).await
     }
 
-    async fn wait_idle(&self, spi: &mut A::Bus) -> Result<(), Error> {
-        self.wait_idle_with_timeout_ms(spi, 10_000).await
-    }
-
-    /// Default `wait_idle` semantics: return at the first all-0xFF
-    /// 8-byte probe. Used for fast-path per-write idle confirmation.
-    async fn wait_idle_with_timeout_ms(&self, spi: &mut A::Bus, timeout_ms: u32) -> Result<(), Error> {
-        self.wait_idle_sustained_ms(spi, timeout_ms, 1).await
-    }
 
     /// Poll busy state with a caller-chosen timeout and a sustained-idle
     /// requirement: return only when `sustained_count` consecutive 8-byte
@@ -890,75 +813,6 @@ where
         outer?
     }
 
-    /// Locked variant: probes on a guard the CALLER holds.
-    ///
-    /// Must not acquire — it runs inside a command that already holds the bus,
-    /// and the arbiter has one permit, so re-acquiring here would deadlock
-    /// against ourselves. The interleaving variant is
-    /// [`Self::wait_idle_reacquiring`].
-    async fn wait_idle_sustained_ms(
-        &self,
-        spi: &mut A::Bus,
-        timeout_ms: u32,
-        sustained_count: u32,
-    ) -> Result<(), Error> {
-        let target = sustained_count.max(1);
-        // Atomic counter so we can tell on timeout whether polling ran
-        // normally (≈ timeout_ms polls — card stayed busy) or was starved
-        // (only a handful of polls — SPI bus mutex held by another path).
-        // The AtomicU32 is ALSO load-bearing for reliability beyond the
-        // diagnostic: removing it (replacing with local u32) on top of the
-        // [u32; 2] alignment fix re-triggers the silent fire27 wedge after
-        // `sd: erasing N blocks` (HIL 2026-05-26 — see docs/spi-dma-and-
-        // wakeup.md §7). LLVM lowers Relaxed fetch_add on Xtensa LX6 to
-        // `s32c1i`, whose AHB bus arbitration / write-buffer flush has
-        // hardware side effects that are not promised by Rust's Relaxed
-        // ordering but are empirically required here. Do not remove.
-        use core::sync::atomic::{AtomicU32, Ordering};
-        static POLLS: AtomicU32 = AtomicU32::new(0);
-        let start_polls = POLLS.load(Ordering::Relaxed);
-        // Word-aligned backing storage. ESP32 PDMA REQUIRES the DMA
-        // source/dest address to be 4-byte aligned; a bare `[u8; 8]` on
-        // stack has alignment 1 and can land at any byte address, and
-        // when it lands non-aligned the PDMA TransferDone IRQ never
-        // fires (TransferInPlace = duplex, both TX and RX paths must be
-        // aligned). Without explicit alignment the outcome is layout-
-        // sensitive: a single info!() elsewhere shifts this stack frame
-        // and can flip a working format path into an indefinite spin
-        // inside the bus driver, which then never yields and traps the
-        // executor itself (no timeout fires, no log appears). Use
-        // [u32; 2] backing and cast on each probe.
-        let outer = with_timeout(self.delay.clone(), timeout_ms, async {
-            let mut consec: u32 = 0;
-            let mut probe_word: [u32; 2];
-            loop {
-                probe_word = [0xFFFFFFFFu32; 2];
-                let probe: &mut [u8; 8] = unsafe {
-                    &mut *(probe_word.as_mut_ptr() as *mut [u8; 8])
-                };
-                spi.transfer_in_place(probe).await.map_err(|_| Error::SpiError)?;
-                POLLS.fetch_add(1, Ordering::Relaxed);
-                if probe.iter().all(|&b| b == 0xFF) {
-                    consec += 1;
-                    if consec >= target {
-                        return Ok(());
-                    }
-                } else {
-                    consec = 0;
-                }
-                self.delay.clone().delay_ms(1).await;
-            }
-        })
-        .await;
-        if let Err(Error::Timeout) = outer {
-            let polls = POLLS.load(Ordering::Relaxed).wrapping_sub(start_polls);
-            error!(
-                "sdspi: wait_idle timed out after {} ms (sustained target {}) polls_in_window={}",
-                timeout_ms, sustained_count, polls
-            );
-        }
-        outer?
-    }
 
     async fn read_byte(&self, spi: &mut A::Bus) -> Result<u8, Error> {
         let mut buf = [0xFFu8; 1];
