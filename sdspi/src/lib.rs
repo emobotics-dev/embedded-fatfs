@@ -840,14 +840,17 @@ where
         // Probe counter, reported ONCE after the wait. The loop parks 1 ms, so
         // probes ~= elapsed ms when the card is simply busy; far fewer probes
         // than elapsed ms means the wait is starving on bus acquisition
-        // instead. Counting is a Cell store; logging per probe would change
-        // what it measures.
-        let probes = core::cell::Cell::new(0u32);
+        // instead. Logging per probe would change what it measures.
+        //
+        // Atomic, not `Cell`: a `Cell` is not `Sync`, which makes this future
+        // non-`Send` and stops the block-device handler being spawnable on a
+        // thread — the host integration tests do exactly that.
+        let probes = core::sync::atomic::AtomicU32::new(0);
         let outer = with_timeout(self.delay.clone(), timeout_ms, async {
             let mut consec: u32 = 0;
             loop {
                 let idle = {
-                    probes.set(probes.get() + 1);
+                    probes.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                     let mut guard = self.bus.acquire().await.ok_or(Error::BusUnavailable)?;
                     let (bus, cs) = guard.split();
                     cs.set_low().map_err(|_| Error::ChipSelect)?;
@@ -875,10 +878,11 @@ where
             }
         })
         .await;
-        if probes.get() > 1_000 {
+        let probes = probes.load(core::sync::atomic::Ordering::Relaxed);
+        if probes > 1_000 {
             debug!(
                 "sdspi: idle wait ended after {} probes (bound {} ms, target {})",
-                probes.get(),
+                probes,
                 timeout_ms,
                 target
             );
