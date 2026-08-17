@@ -200,10 +200,17 @@ where
         // token wait, which is what no fixed `transaction()` could express.
         let (spi, cs) = _guard.split();
         cs.set_low().map_err(|_| Error::ChipSelect)?;
+        // What CMD0 actually answers, reported once if the loop gives up. All
+        // 0xFF means MISO never went low: the card is not driving the line at
+        // all (not selected, unpowered, or the pad is not routed to MISO) —
+        // a different fault from a card answering with the wrong R1. Without
+        // it the failure is an undifferentiated `Timeout`.
+        let last_r1 = core::sync::atomic::AtomicU32::new(0x1_0000);
         let r = async {
             with_timeout(self.delay.clone(), 1000, async {
                 loop {
                     let r = self.cmd(spi, idle()).await?;
+                    last_r1.store(r as u32, core::sync::atomic::Ordering::Relaxed);
                     if r == R1_IDLE_STATE {
                         return Ok(());
                     }
@@ -334,9 +341,13 @@ where
         // Single-block commands bound the hold to one block and free the bus
         // between them. Costs one command per block; the alternative is an
         // unbounded shared-bus hold, which no outer timeout can fix (#46).
+        // Settle ONCE. Between two reads the card is never busy (no program
+        // cycle), so a per-block idle probe is redundant work on the critical
+        // path -- and a FAT scan is thousands of blocks, where that redundancy
+        // showed up as a logger that started ~39 s late.
+        self.settle().await?;
         for (i, block) in data.iter_mut().enumerate() {
             let addr = block_address + i as u32;
-            self.settle().await?;
             let mut guard = self.lock().await?;
             // CS low for the whole command: the transfers below never touch it,
             // so it cannot rise mid-command — not across the token wait either,
@@ -372,9 +383,12 @@ where
         // with CS pinned low. That is the hold no outer backstop can bound
         // (#46). ACMD23 pre-erase goes with it; the format path already writes
         // pre-erased.
+        // Settle ONCE: after each block the program-cycle wait below already
+        // leaves the card idle, so re-probing before the next command adds a
+        // round trip and proves nothing new.
+        self.settle().await?;
         for (i, block) in data.iter().enumerate() {
             let addr = block_address + i as u32;
-            self.settle().await?;
             {
                 let mut guard = self.lock().await?;
                 let (spi, cs) = guard.split();
