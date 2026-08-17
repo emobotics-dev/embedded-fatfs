@@ -760,6 +760,20 @@ where
         // corrupt. That is why the old device-per-probe wait was safe, and why
         // moving it outside the lock loses nothing.
 
+        // N_RC: the SD spec requires at least 8 clock cycles between the end of
+        // a response and the start of the next command. Most commands got that
+        // for free -- their R1 is read in an 8-byte window, so up to 7 padding
+        // bytes of clocks follow. The commands in `has_trailing_bytes` do NOT:
+        // they read exactly R1 and then exactly the trailing payload, leaving
+        // no gap at all.
+        //
+        // A card that enforces N_RC then ignores the next command outright --
+        // no R1, no error, silence. That is what killed cores3 SD init: CMD0,
+        // CMD59 and CMD8 all succeeded, and CMD55 (issued straight after CMD8's
+        // 4-byte R7 read) was never answered. One byte of idle clocks here
+        // makes the gap unconditional instead of a side effect of padding.
+        spi.write(&[0xFF]).await.map_err(|_| Error::SpiError)?;
+
         let mut buf = [
             0x40 | cmd.cmd,
             (cmd.arg >> 24) as u8,
