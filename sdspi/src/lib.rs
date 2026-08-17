@@ -79,6 +79,28 @@ impl R1Status {
     pub fn ready(self) -> bool { self.0 == 0 }
     pub fn errors(self) -> u8 { self.0 & Self::ERROR_MASK }
 
+    /// Faults that are wrong in EVERY card state, so `cmd()` can reject them
+    /// without knowing what the caller was probing for.
+    ///
+    /// `ILLEGAL_COMMAND` and `ERASE_RESET` are deliberately excluded: they are
+    /// legitimate answers, not failures. CMD8 identifies a v1 card *by* being
+    /// refused, and some cards refuse CMD59. Treating them as hard errors makes
+    /// a normal negotiation look like a broken card.
+    pub const ALWAYS_FAULT_MASK: u8 =
+        Self::COM_CRC_ERROR | Self::PARAMETER_ERROR | Self::ADDRESS_ERROR
+        | Self::ERASE_SEQUENCE_ERROR;
+
+    /// The unconditional fault this R1 reports, if any. Used by `cmd()`.
+    pub fn to_hard_error(self) -> Option<Error> {
+        if !self.is_valid() {
+            return Some(Error::NoResponse);
+        }
+        if self.0 & Self::ALWAYS_FAULT_MASK == 0 {
+            return None;
+        }
+        self.to_error()
+    }
+
     /// The first fault the card reports, most severe first, or `None`.
     ///
     /// Order matters: a CRC error means the command never took effect, so it is
@@ -343,12 +365,8 @@ where
 
             // "The SPI interface is initialized in the CRC OFF mode in default"
             // -- SD Part 1 Physical Layer Specification v9.00, Section 7.2.2 Bus Transfer Protection
-            match self.cmd(spi, cmd::<R1>(0x3B, 1)).await {
-                Ok(r) if r == R1_IDLE_STATE => {}
-                // A card that refuses CRC-off, or answers from the wrong state,
-                // is reported as the CMD59 failure it is.
-                Ok(_) | Err(Error::IllegalCommand) => return Err(Error::Cmd59Error),
-                Err(e) => return Err(e),
+            if self.cmd(spi, cmd::<R1>(0x3B, 1)).await? != R1_IDLE_STATE {
+                return Err(Error::Cmd59Error);
             }
 
             with_timeout(self.delay.clone(), 1000, async {
@@ -357,10 +375,10 @@ where
                     // it, which identifies the card rather than being a fault.
                     // `cmd()` now surfaces that bit as an error, so catch it
                     // here instead of comparing raw bytes.
-                    match self.cmd(spi, send_if_cond(0x1, 0xAA)).await {
-                        Ok(_) => {}
-                        Err(Error::IllegalCommand) => return Err(Error::UnsupportedCard),
-                        Err(e) => return Err(e),
+                    let r = self.cmd(spi, send_if_cond(0x1, 0xAA)).await?;
+                    if R1Status(r).0 & R1Status::ILLEGAL_COMMAND != 0 {
+                        // v1 card: it refuses CMD8. That identifies it.
+                        return Err(Error::UnsupportedCard);
                     }
                     let mut buffer = [0xFFu8; 4];
                     spi.transfer_in_place(&mut buffer[..]).await.map_err(|_| Error::SpiError)?;
@@ -903,7 +921,11 @@ where
         // Every R1 error bit is a fault the card is reporting; returning the
         // raw byte let callers compare against the one value they expected and
         // silently ignore the rest.
-        if let Some(e) = R1Status(byte).to_error() {
+        // Only the always-wrong bits. Illegal-command and erase-reset are
+        // answers a caller may be probing for (CMD8 on a v1 card, CMD59 on a
+        // card that refuses CRC mode) -- rejecting those here turned a normal
+        // negotiation into an init failure.
+        if let Some(e) = R1Status(byte).to_hard_error() {
             error!("sdspi: cmd {} R1=0x{:02x}: {:?}", cmd.cmd, byte, e);
             return Err(e);
         }
@@ -1138,6 +1160,34 @@ mod response_tests {
         // A bad CRC means the command never ran, so it outranks ADDRESS_ERROR.
         let both = R1Status(R1Status::COM_CRC_ERROR | R1Status::ADDRESS_ERROR);
         assert_eq!(both.to_error(), Some(Error::CommandCrcError));
+    }
+
+    #[test]
+    fn illegal_command_is_an_answer_not_a_hard_error() {
+        // CMD8 identifies a v1 card BY being refused, and some cards refuse
+        // CMD59. cmd() must pass these through so the caller can interpret
+        // them; rejecting them turned a normal negotiation into an init
+        // failure that looked like a dead card.
+        let r = R1Status(R1Status::ILLEGAL_COMMAND | R1Status::IDLE);
+        assert_eq!(r.to_hard_error(), None);
+        assert_eq!(r.to_error(), Some(Error::IllegalCommand), "still decodable on demand");
+        assert_eq!(R1Status(R1Status::ERASE_RESET).to_hard_error(), None);
+    }
+
+    #[test]
+    fn unconditional_faults_are_always_rejected() {
+        for (bit, want) in [
+            (R1Status::COM_CRC_ERROR, Error::CommandCrcError),
+            (R1Status::PARAMETER_ERROR, Error::ParameterError),
+            (R1Status::ADDRESS_ERROR, Error::AddressError),
+            (R1Status::ERASE_SEQUENCE_ERROR, Error::EraseSequenceError),
+        ] {
+            assert_eq!(R1Status(bit).to_hard_error(), Some(want), "bit {bit:#04x}");
+            assert_eq!(R1Status(bit | R1Status::IDLE).to_hard_error(), Some(want));
+        }
+        assert_eq!(R1Status(0x00).to_hard_error(), None);
+        assert_eq!(R1Status(R1Status::IDLE).to_hard_error(), None);
+        assert_eq!(R1Status(0xFF).to_hard_error(), Some(Error::NoResponse));
     }
 
     #[test]
