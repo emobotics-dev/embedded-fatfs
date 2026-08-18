@@ -255,7 +255,7 @@ where
 /// and between busy probes, which is what lets the display share the bus.
 use embedded_hal_async::spi::SpiBus as _;
 
-/// Driver position, so a parked SD op is located rather than guessed at.
+/// Where the driver is, so a parked SD op reports its site.
 /// Frozen [`PHASE`]+[`PHASE_SEQ`] = parked there; moving SEQ = looping.
 /// 10 acquire, 20 cmd, 30 read token, 40 payload, 60 idle probe, 0 none.
 pub static PHASE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
@@ -469,6 +469,8 @@ where
             let mut csd = [0xFFu8; 16];
             self.read_data(spi, &mut csd).await?;
             card.csd = u128::from_be_bytes(csd).into();
+            // TRAN_SPEED: 0x32 = 25 MHz default speed, 0x5a = 50 MHz high speed.
+            debug!("sdspi: CSD TRAN_SPEED 0x{:02x}", card.csd.transfer_rate());
 
             trace!("all_send_cid");
             let r = self.cmd(spi, send_cid(card.rca as u16)).await?;
@@ -809,9 +811,9 @@ where
     /// the next command. Commands that read exactly their payload leave none,
     /// and a card that enforces it answers the next command with silence.
     ///
-    /// From DRAM, never `write(&[0xFF])`: a promoted constant lives in flash,
-    /// which selects a copy path whose 1-byte transfer can hang holding the bus
-    /// (docs/spi-dma-and-wakeup.md §14). Four bytes keeps it 4-aligned for PDMA.
+    /// The buffer must be DRAM-resident and 4-aligned: a flash literal selects
+    /// esp-hal's copy path, and PDMA requires the alignment. Four bytes gives
+    /// both, and 32 idle clocks where the spec asks for 8.
     async fn clock_n_rc_gap(spi: &mut A::Bus) -> Result<(), Error> {
         let mut gap = [0xFFFF_FFFFu32; 1];
         let bytes: &mut [u8; 4] = unsafe { &mut *(gap.as_mut_ptr() as *mut [u8; 4]) };
