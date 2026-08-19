@@ -245,6 +245,10 @@ where
 }
 
 
+use embedded_hal_async::spi::SpiBus as _;
+
+use embedded_hal::digital::OutputPin as _;
+
 /// The only way to reach the SPI bus.
 ///
 /// `SdSpi` holds one of these instead of a device, so a command that forgets to
@@ -253,23 +257,6 @@ where
 /// Granularity is per COMMAND: acquire once, pass the guard to the helpers, so
 /// command/token-wait/payload cannot be interleaved. Released between commands
 /// and between busy probes, which is what lets the display share the bus.
-use embedded_hal_async::spi::SpiBus as _;
-
-/// Where the driver is, so a parked SD op reports its site.
-/// Frozen [`PHASE`]+[`PHASE_SEQ`] = parked there; moving SEQ = looping.
-/// 10 acquire, 20 cmd, 30 read token, 40 payload, 60 idle probe, 0 none.
-pub static PHASE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-/// Bumped on every [`PHASE`] change. See [`PHASE`].
-pub static PHASE_SEQ: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-
-#[inline]
-fn phase(p: u32) {
-    PHASE.store(p, core::sync::atomic::Ordering::Relaxed);
-    PHASE_SEQ.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-}
-
-use embedded_hal::digital::OutputPin as _;
-
 pub trait BusAccess {
     /// The raw bus. NOT a `SpiDevice`: a `SpiDevice` asserts CS on entry to
     /// every call and deasserts on exit, so a command built from several calls
@@ -336,9 +323,7 @@ where
 
     /// Take the bus for one command, or fail the command.
     async fn lock(&self) -> Result<A::Guard<'_>, Error> {
-        phase(10);
         let g = self.bus.acquire().await.ok_or(Error::BusUnavailable);
-        phase(0);
         g
     }
 
@@ -694,7 +679,6 @@ where
         let found = with_timeout(self.delay.clone(), wall(1000), async {
             loop {
                 window.fill(0xFF);
-                phase(30);
                 spi.transfer_in_place(&mut window[..]).await.map_err(|_| Error::SpiError)?;
                 if let Some(i) = window.iter().position(|&b| b != 0xFF) {
                     return Ok::<usize, Error>(i);
@@ -735,14 +719,11 @@ where
         let mut crc_bytes = [0xFFu8; 2];
         if carry < buffer.len() {
             buffer[carry..].fill(0xFF);
-            phase(40);
             spi.transfer_in_place(&mut buffer[carry..])
                 .await
                 .map_err(|_| Error::SpiError)?;
         }
-        phase(41);
         spi.transfer_in_place(&mut crc_bytes).await.map_err(|_| Error::SpiError)?;
-        phase(0);
         let crc = u16::from_be_bytes(crc_bytes);
         let calc_crc = crc16(buffer);
         if crc != calc_crc {
@@ -831,7 +812,6 @@ where
         // corrupt. That is why the old device-per-probe wait was safe, and why
         // moving it outside the lock loses nothing.
 
-        phase(20);
         Self::clock_n_rc_gap(spi).await?;
 
         let mut buf = [
@@ -892,9 +872,7 @@ where
                 .write(&buf)
                 .await
                 .map_err(|_| Error::SpiError)?;
-            phase(21);
             spi.transfer_in_place(&mut stuff).await.map_err(|_| Error::SpiError)?;
-            phase(22);
             spi.transfer_in_place(&mut response[..1]).await.map_err(|_| Error::SpiError)?;
         } else {
             let resp_len = if has_trailing_bytes { 1 } else { 8 };
@@ -902,7 +880,6 @@ where
                 .write(&buf)
                 .await
                 .map_err(|_| Error::SpiError)?;
-            phase(23);
             spi.transfer_in_place(&mut response[..resp_len])
                 .await
                 .map_err(|_| Error::SpiError)?;
@@ -1028,12 +1005,10 @@ where
                     let mut probe_word = [0xFFFF_FFFFu32; 2];
                     let probe: &mut [u8; 8] =
                         unsafe { &mut *(probe_word.as_mut_ptr() as *mut [u8; 8]) };
-                    phase(60);
                     bus
                         .transfer_in_place(probe)
                         .await
                         .map_err(|_| Error::SpiError)?;
-                    phase(0);
                     probe.iter().all(|&b| b == 0xFF)
                     // guard dropped here — the display's turn
                 };
