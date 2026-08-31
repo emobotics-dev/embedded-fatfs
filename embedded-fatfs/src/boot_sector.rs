@@ -777,6 +777,26 @@ fn format_bpb<E: IoError>(
     Ok((bpb, fat_type))
 }
 
+/// Sectors the format writes as filesystem metadata: reserved sectors, every
+/// FAT, and the root directory. Everything beyond this is data area, which a
+/// freshly formatted volume never reads.
+///
+/// Exposed so a caller that pre-erases can erase exactly this extent instead of
+/// the whole medium. Card-native erase time scales with the erased range, so
+/// erasing a whole card makes format duration a property of the medium rather
+/// than of the filesystem — on a 16 GB card that exceeded a 150 s bound while
+/// an 8 GB one finished in 2.5 s.
+///
+/// Uses the same `format_bpb` the format itself uses, so the two cannot drift.
+pub fn format_metadata_sectors<E: IoError>(
+    options: &FormatVolumeOptions,
+    total_sectors: u32,
+    bytes_per_sector: u16,
+) -> Result<u32, Error<E>> {
+    let (bpb, _fat_type) = format_bpb::<E>(options, total_sectors, bytes_per_sector)?;
+    Ok(bpb.reserved_sectors() + bpb.sectors_per_all_fats() + bpb.root_dir_sectors())
+}
+
 pub(crate) fn format_boot_sector<E: IoError>(
     options: &FormatVolumeOptions,
     total_sectors: u32,

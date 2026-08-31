@@ -75,6 +75,7 @@ mod io;
 mod table;
 mod time;
 
+pub use crate::boot_sector::format_metadata_sectors;
 pub use crate::dir::*;
 pub use crate::dir_entry::*;
 pub use crate::error::*;
