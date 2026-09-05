@@ -838,22 +838,22 @@ where
 
         Self::clock_n_rc_gap(spi).await?;
 
-        // 6 bytes, and deliberately NOT padded to a word.
+        // 6 command bytes in a word-aligned 8, sent with `transfer_in_place`.
         //
-        // Padding looks right -- it would make the transfer DMA-compatible and
-        // keep it off the copy path -- but `write()` does not capture MISO, so
-        // the extra clocked bytes are sent DEAF. NCR (command-to-R1) is 1-8
-        // bytes, so R1 can land inside the padding and be lost; measured, this
-        // fails init outright. Making this word-aligned requires capturing the
-        // padding with `transfer_in_place` and scanning it for R1 first.
-        let mut buf = [
-            0x40 | cmd.cmd,
-            (cmd.arg >> 24) as u8,
-            (cmd.arg >> 16) as u8,
-            (cmd.arg >> 8) as u8,
-            cmd.arg as u8,
-            0,
-        ];
+        // LENGTH is what disqualifies a transfer on esp32: 6 is not a multiple
+        // of 4, so a plain write takes the DMA copy path whose degenerate small
+        // transfers hang holding the bus. Padding to 8 fixes that -- but ONLY
+        // with `transfer_in_place`. `write()` does not capture MISO, and NCR
+        // (command-to-R1) is 1-8 bytes, so a deaf pad can clock R1 away;
+        // measured, that fails init outright. Captured, the two padding bytes
+        // are simply the first slice of the response window.
+        let mut cmd_word = [0xFFFF_FFFFu32; 2];
+        let buf: &mut [u8; 8] = unsafe { &mut *(cmd_word.as_mut_ptr() as *mut [u8; 8]) };
+        buf[0] = 0x40 | cmd.cmd;
+        buf[1] = (cmd.arg >> 24) as u8;
+        buf[2] = (cmd.arg >> 16) as u8;
+        buf[3] = (cmd.arg >> 8) as u8;
+        buf[4] = cmd.arg as u8;
         buf[5] = crc7(&buf[0..5]);
 
         // Send command + read the full SD-spec NCR window in a single
@@ -895,34 +895,43 @@ where
         let response: &mut [u8; 8] = unsafe {
             &mut *(response_word.as_mut_ptr() as *mut [u8; 8])
         };
-        // One byte, and NOT exempt from the DMA rule -- length 1 is not a
-        // multiple of 4, so this is the degenerate copy-path transfer. It is
-        // left as-is only because widening it changes how many bytes are
-        // clocked before R1 is read; see the command buffer above.
-        let mut stuff = [0xFFu8; 1];
 
-        if cmd.cmd == stop_transmission().cmd {
-            // CMD12 has a mandatory stuff byte before R1 (SPI-mode
-            // erratum). Keep the original two-slot read.
-            spi
-                .write(&buf)
-                .await
-                .map_err(|_| Error::SpiError)?;
-            spi.transfer_in_place(&mut stuff).await.map_err(|_| Error::SpiError)?;
-            spi.transfer_in_place(&mut response[..1]).await.map_err(|_| Error::SpiError)?;
-        } else {
-            let resp_len = if has_trailing_bytes { 1 } else { 8 };
-            spi
-                .write(&buf)
-                .await
-                .map_err(|_| Error::SpiError)?;
-            spi.transfer_in_place(&mut response[..resp_len])
-                .await
-                .map_err(|_| Error::SpiError)?;
+        let is_cmd12 = cmd.cmd == stop_transmission().cmd;
+        spi.transfer_in_place(&mut buf[..]).await.map_err(|_| Error::SpiError)?;
+
+        // R1 may already sit in the captured padding. CMD12 discards the first
+        // of those two as its mandatory stuff byte (SPI-mode erratum), which is
+        // why the separate 1-byte stuff read is gone -- that degenerate
+        // transfer disappears with it.
+        let pad_from = if is_cmd12 { 7 } else { 6 };
+        if let Some(r1) = buf[pad_from..8].iter().copied().find(|b| b & 0x80 == 0) {
+            if is_cmd12 || has_trailing_bytes {
+                // Return NOW, leaving whatever is queued behind R1 untouched --
+                // the data-start token of a CMD17/18 is exactly what the narrow
+                // `resp_len` below exists to protect.
+                return Ok(r1);
+            }
+            // Everything else still clocks its full response window, even
+            // though R1 is already in hand.
+            //
+            // That window is not only how R1 is found: for a block write it is
+            // also the ONLY idle between R1 and the data token, because
+            // `write_data` follows `cmd()` directly with no `clock_n_rc_gap`
+            // between them. Returning early here cut that gap from 8 clocked
+            // bytes to as few as 2, which a permissive card tolerates and a
+            // strict one does not -- measured as a 21 s write stall on one
+            // bench card while another formatted fine.
+            spi.transfer_in_place(&mut response[..8]).await.map_err(|_| Error::SpiError)?;
+            return Ok(r1);
         }
 
+        let resp_len = if is_cmd12 || has_trailing_bytes { 1 } else { 8 };
+        spi.transfer_in_place(&mut response[..resp_len])
+            .await
+            .map_err(|_| Error::SpiError)?;
+
         // Scan the response window for the first non-0xFF byte (R1).
-        let scan_len = if cmd.cmd == stop_transmission().cmd || has_trailing_bytes { 1 } else { 8 };
+        let scan_len = if is_cmd12 || has_trailing_bytes { 1 } else { 8 };
         for &b in &response[..scan_len] {
             if b & 0x80 == 0 {
                 return Ok(b);
