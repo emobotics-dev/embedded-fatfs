@@ -854,22 +854,29 @@ where
 
         Self::clock_n_rc_gap(spi).await?;
 
-        // 6 bytes, and deliberately NOT padded to a word.
+        // 6 command bytes in a word-aligned 8, sent with `transfer_in_place`.
         //
-        // Padding looks right -- it would make the transfer DMA-compatible and
-        // keep it off the copy path -- but `write()` does not capture MISO, so
-        // the extra clocked bytes are sent DEAF. NCR (command-to-R1) is 1-8
-        // bytes, so R1 can land inside the padding and be lost; measured, this
-        // fails init outright. Making this word-aligned requires capturing the
-        // padding with `transfer_in_place` and scanning it for R1 first.
-        let mut buf = [
-            0x40 | cmd.cmd,
-            (cmd.arg >> 24) as u8,
-            (cmd.arg >> 16) as u8,
-            (cmd.arg >> 8) as u8,
-            cmd.arg as u8,
-            0,
-        ];
+        // LENGTH is what disqualifies a transfer on esp32: 6 is not a multiple
+        // of 4, so a plain write takes the DMA copy path whose degenerate small
+        // transfers hang holding the bus. Padding to 8 fixes that -- but ONLY
+        // with `transfer_in_place`. `write()` does not capture MISO, and NCR
+        // (command-to-R1) is 1-8 bytes, so a deaf pad can clock R1 away;
+        // measured, that fails init outright. Captured, the two padding bytes
+        // are simply the first slice of the response window.
+        //
+        // This changes WHICH DMA PATH the command takes and nothing else. How
+        // many bytes are clocked after the command, and when a caller returns,
+        // are deliberately left exactly as they were -- those are a separate
+        // concern with a separate failure mode (the idle between R1 and a block
+        // write's data token), and bundling them is what made the previous
+        // slice untestable.
+        let mut cmd_word = [0xFFFF_FFFFu32; 2];
+        let buf: &mut [u8; 8] = unsafe { &mut *(cmd_word.as_mut_ptr() as *mut [u8; 8]) };
+        buf[0] = 0x40 | cmd.cmd;
+        buf[1] = (cmd.arg >> 24) as u8;
+        buf[2] = (cmd.arg >> 16) as u8;
+        buf[3] = (cmd.arg >> 8) as u8;
+        buf[4] = cmd.arg as u8;
         buf[5] = crc7(&buf[0..5]);
 
         // Send command + read the full SD-spec NCR window in a single
@@ -917,21 +924,36 @@ where
         // clocked before R1 is read; see the command buffer above.
         let mut stuff = [0xFFu8; 1];
 
-        if cmd.cmd == stop_transmission().cmd {
+        let is_cmd12 = cmd.cmd == stop_transmission().cmd;
+        spi.transfer_in_place(&mut buf[..]).await.map_err(|_| Error::SpiError)?;
+
+        // R1 can land in the two captured padding bytes, which the old deaf
+        // `write()` could not see. It MUST be scanned before anything else is
+        // clocked: for a command with trailing bytes, one more byte read here
+        // consumes the caller's first trailing byte and misaligns it -- CMD8
+        // and CMD58 in init, measured as an outright init failure.
+        if let Some(r1) = buf[6..8].iter().copied().find(|b| b & 0x80 == 0) {
+            if is_cmd12 || has_trailing_bytes {
+                // Return NOW, leaving what is queued behind R1 untouched.
+                return Ok(r1);
+            }
+            // Everything else still clocks its full response window even
+            // though R1 is in hand, because for a block write that window is
+            // the ONLY idle between R1 and the data token -- `write_data`
+            // follows `cmd()` with no gap of its own. Shortening it is a
+            // separate change with a separate failure mode, and is not part
+            // of this slice.
+            spi.transfer_in_place(&mut response[..8]).await.map_err(|_| Error::SpiError)?;
+            return Ok(r1);
+        }
+
+        if is_cmd12 {
             // CMD12 has a mandatory stuff byte before R1 (SPI-mode
             // erratum). Keep the original two-slot read.
-            spi
-                .write(&buf)
-                .await
-                .map_err(|_| Error::SpiError)?;
             spi.transfer_in_place(&mut stuff).await.map_err(|_| Error::SpiError)?;
             spi.transfer_in_place(&mut response[..1]).await.map_err(|_| Error::SpiError)?;
         } else {
             let resp_len = if has_trailing_bytes { 1 } else { 8 };
-            spi
-                .write(&buf)
-                .await
-                .map_err(|_| Error::SpiError)?;
             spi.transfer_in_place(&mut response[..resp_len])
                 .await
                 .map_err(|_| Error::SpiError)?;
