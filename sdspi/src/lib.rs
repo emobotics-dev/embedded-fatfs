@@ -759,23 +759,25 @@ where
         // tiny DMA transfer against a zero-length rx buffer that intermittently
         // never completes -- and then waits forever holding the shared bus.
         //
-        // The padding is protocol-legal in both cases: idle 0xFF *before* the
-        // data token is what the card expects between packets, and the two
-        // trailing 0xFF after the CRC are the NCR gap it needs before driving
-        // the data-response token, which the 8-byte status scan below picks up.
-        // The token goes out as a word-aligned 4 with LEADING idle: idle 0xFF
-        // before a data token is exactly what the card expects between
-        // packets, and nothing is being clocked back, so nothing can be lost.
-        // That takes the block write's 1-byte transfer -- the degenerate
-        // copy-path case that hangs the bus -- off DMA's bad path.
+        // Token and CRC both go out as word-aligned 4-byte transfers, so
+        // neither reaches the copy path whose degenerate small transfer hangs
+        // the bus. The padding is protocol-legal in each case:
         //
-        // The CRC is NOT padded the same way: the card drives the data
-        // response token right after it, and `write()` is deaf, so trailing
-        // idle here would clock the response away.
-        let crc_bytes = crc16(buffer).to_be_bytes();
+        //   token: LEADING idle 0xFF, which is what the card expects between
+        //          packets. Sent with `write()` -- nothing is coming back yet,
+        //          so being deaf costs nothing.
+        //   CRC:   TRAILING idle, which is the gap before the card drives the
+        //          data-response token. Sent with `transfer_in_place`, NOT
+        //          `write()`: the response can land inside those two bytes and
+        //          a deaf transfer would clock it away.
+        let crc = crc16(buffer).to_be_bytes();
         let mut token_word = [0xFFFF_FFFFu32; 1];
         let token_buf: &mut [u8; 4] = unsafe { &mut *(token_word.as_mut_ptr() as *mut [u8; 4]) };
         token_buf[3] = token;
+        let mut crc_word = [0xFFFF_FFFFu32; 1];
+        let crc_buf: &mut [u8; 4] = unsafe { &mut *(crc_word.as_mut_ptr() as *mut [u8; 4]) };
+        crc_buf[0] = crc[0];
+        crc_buf[1] = crc[1];
         // Word-aligned: ESP32 PDMA needs 4-byte aligned DMA buffers;
         // a bare `[u8; 8]` on stack is alignment 1. See wait_idle probe
         // comment for the failure mode. `[u32; 2]` forces 4-aligned.
@@ -785,11 +787,25 @@ where
         };
         spi.write(&token_buf[..]).await.map_err(|_| Error::SpiError)?;
         spi.write(buffer).await.map_err(|_| Error::SpiError)?;
-        spi.write(&crc_bytes).await.map_err(|_| Error::SpiError)?;
+        spi.transfer_in_place(&mut crc_buf[..]).await.map_err(|_| Error::SpiError)?;
+        // ALWAYS clock the status window, even when the response already
+        // arrived in the CRC transfer's padding. It is not only how the token
+        // is found -- it is what clocks the card through the busy it asserts
+        // right after the response, and skipping it leaves the next operation
+        // to start against a busy card and stall on its backstop (measured: a
+        // 21 s BD-handler write stall).
         spi.transfer_in_place(status_buf).await.map_err(|_| Error::SpiError)?;
 
-        for &b in &*status_buf {
-            if b != 0xFF {
+        // One ordered window: the CRC transfer's two trailing bytes, then the
+        // status read. Matched on the token's SHAPE (`xxx0sss1`), not on
+        // "anything that is not 0xFF" -- the card drives MISO low while busy,
+        // so 0x00 appears here routinely and decodes as a bogus rejection.
+        let mut window = [0xFFu8; 10];
+        window[..2].copy_from_slice(&crc_buf[2..4]);
+        window[2..].copy_from_slice(&status_buf[..]);
+
+        for &b in &window {
+            if b & 0x11 == 0x01 {
                 let response = DataResponse(b);
                 if let Some(e) = response.to_error() {
                     // Return WHICH rejection, not a blanket WriteError: a CRC
@@ -802,8 +818,8 @@ where
                 return Ok(());
             }
         }
-        // No response in 8 bytes — card violated spec / lost sync.
-        error!("sdspi: write_data no data-response token in 8-byte window");
+        // No response in the 10-byte window — card violated spec / lost sync.
+        error!("sdspi: write_data no data-response token in 10-byte window");
         Err(Error::WriteError)
     }
 
