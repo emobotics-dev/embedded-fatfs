@@ -905,8 +905,16 @@ where
         // these commands is recoverable.
         let has_trailing_bytes = matches!(cmd.cmd, 8 | 9 | 10 | 13 | 17 | 18 | 58);
         // Word-aligned 8-byte response. See wait_idle probe comment for the
-        // ESP32 PDMA alignment hazard. `stuff` is only one byte so DMA
-        // alignment is moot (1-byte transfers don't need word alignment).
+        // ESP32 PDMA alignment hazard.
+        //
+        // This used to add that `stuff` was "only one byte so DMA alignment is
+        // moot (1-byte transfers don't need word alignment)". That was FALSE
+        // and it was load-bearing: LENGTH is the disqualifier on esp32, not
+        // address alignment, so a 1-byte transfer is exactly the degenerate
+        // copy-path case -- the hazard the sentence dismissed. It survived a
+        // rewrite of this function that deleted the `stuff` variable it named,
+        // and it talked a later reader into leaving that transfer in place on
+        // the CMD12 path, which a strict card then hung on for every format.
         let mut response_word = [0xFFFFFFFFu32; 2];
         let response: &mut [u8; 8] = unsafe {
             &mut *(response_word.as_mut_ptr() as *mut [u8; 8])
