@@ -716,15 +716,21 @@ where
         let carry = core::cmp::min(WINDOW - (i + 1), buffer.len());
         buffer[..carry].copy_from_slice(&window[i + 1..i + 1 + carry]);
 
-        let mut crc_bytes = [0xFFu8; 2];
+        // 4 bytes, not 2, from a word-aligned buffer: esp32 rejects a transfer
+        // whose pointer OR length is not a multiple of 4 and diverts it to the
+        // copy path, whose degenerate small transfers hang (see the write side
+        // below). The card clocks out idle 0xFF after the CRC, so reading two
+        // extra bytes is free and only the first two are used.
+        let mut crc_word = [0xFFFF_FFFFu32; 1];
+        let crc_buf: &mut [u8; 4] = unsafe { &mut *(crc_word.as_mut_ptr() as *mut [u8; 4]) };
         if carry < buffer.len() {
             buffer[carry..].fill(0xFF);
             spi.transfer_in_place(&mut buffer[carry..])
                 .await
                 .map_err(|_| Error::SpiError)?;
         }
-        spi.transfer_in_place(&mut crc_bytes).await.map_err(|_| Error::SpiError)?;
-        let crc = u16::from_be_bytes(crc_bytes);
+        spi.transfer_in_place(crc_buf).await.map_err(|_| Error::SpiError)?;
+        let crc = u16::from_be_bytes([crc_buf[0], crc_buf[1]]);
         let calc_crc = crc16(buffer);
         if crc != calc_crc {
             return Err(Error::CrcMismatch(crc, calc_crc));
@@ -747,8 +753,29 @@ where
         // with WriteError. Mirror the cmd() fast-path: clock 8 bytes
         // in the same transaction and scan for the first non-0xFF byte
         // (the response token).
+        // Both of these go out as 4-byte word-aligned transfers rather than 1
+        // and 2 raw bytes. esp32 diverts any transfer whose pointer OR length
+        // is not a multiple of 4 to the copy path, which issues a degenerate
+        // tiny DMA transfer against a zero-length rx buffer that intermittently
+        // never completes -- and then waits forever holding the shared bus.
+        //
+        // The padding is protocol-legal in both cases: idle 0xFF *before* the
+        // data token is what the card expects between packets, and the two
+        // trailing 0xFF after the CRC are the NCR gap it needs before driving
+        // the data-response token, which the 8-byte status scan below picks up.
+        // The token goes out as a word-aligned 4 with LEADING idle: idle 0xFF
+        // before a data token is exactly what the card expects between
+        // packets, and nothing is being clocked back, so nothing can be lost.
+        // That takes the block write's 1-byte transfer -- the degenerate
+        // copy-path case that hangs the bus -- off DMA's bad path.
+        //
+        // The CRC is NOT padded the same way: the card drives the data
+        // response token right after it, and `write()` is deaf, so trailing
+        // idle here would clock the response away.
         let crc_bytes = crc16(buffer).to_be_bytes();
-        let token_buf = [token];
+        let mut token_word = [0xFFFF_FFFFu32; 1];
+        let token_buf: &mut [u8; 4] = unsafe { &mut *(token_word.as_mut_ptr() as *mut [u8; 4]) };
+        token_buf[3] = token;
         // Word-aligned: ESP32 PDMA needs 4-byte aligned DMA buffers;
         // a bare `[u8; 8]` on stack is alignment 1. See wait_idle probe
         // comment for the failure mode. `[u32; 2]` forces 4-aligned.
@@ -756,10 +783,7 @@ where
         let status_buf: &mut [u8; 8] = unsafe {
             &mut *(status_word.as_mut_ptr() as *mut [u8; 8])
         };
-        spi
-            .write(&token_buf)
-            .await
-            .map_err(|_| Error::SpiError)?;
+        spi.write(&token_buf[..]).await.map_err(|_| Error::SpiError)?;
         spi.write(buffer).await.map_err(|_| Error::SpiError)?;
         spi.write(&crc_bytes).await.map_err(|_| Error::SpiError)?;
         spi.transfer_in_place(status_buf).await.map_err(|_| Error::SpiError)?;
@@ -814,6 +838,14 @@ where
 
         Self::clock_n_rc_gap(spi).await?;
 
+        // 6 bytes, and deliberately NOT padded to a word.
+        //
+        // Padding looks right -- it would make the transfer DMA-compatible and
+        // keep it off the copy path -- but `write()` does not capture MISO, so
+        // the extra clocked bytes are sent DEAF. NCR (command-to-R1) is 1-8
+        // bytes, so R1 can land inside the padding and be lost; measured, this
+        // fails init outright. Making this word-aligned requires capturing the
+        // padding with `transfer_in_place` and scanning it for R1 first.
         let mut buf = [
             0x40 | cmd.cmd,
             (cmd.arg >> 24) as u8,
@@ -863,6 +895,10 @@ where
         let response: &mut [u8; 8] = unsafe {
             &mut *(response_word.as_mut_ptr() as *mut [u8; 8])
         };
+        // One byte, and NOT exempt from the DMA rule -- length 1 is not a
+        // multiple of 4, so this is the degenerate copy-path transfer. It is
+        // left as-is only because widening it changes how many bytes are
+        // clocked before R1 is read; see the command buffer above.
         let mut stuff = [0xFFu8; 1];
 
         if cmd.cmd == stop_transmission().cmd {
