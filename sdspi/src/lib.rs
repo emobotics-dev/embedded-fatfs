@@ -919,15 +919,26 @@ where
         // of those two as its mandatory stuff byte (SPI-mode erratum), which is
         // why the separate 1-byte stuff read is gone -- that degenerate
         // transfer disappears with it.
-        //
-        // Returning straight from here also leaves anything queued BEHIND R1
-        // untouched -- the data-start token of a CMD17/18 -- which is exactly
-        // what the narrow `resp_len` below exists to protect.
         let pad_from = if is_cmd12 { 7 } else { 6 };
-        for &b in &buf[pad_from..8] {
-            if b & 0x80 == 0 {
-                return Ok(b);
+        if let Some(r1) = buf[pad_from..8].iter().copied().find(|b| b & 0x80 == 0) {
+            if is_cmd12 || has_trailing_bytes {
+                // Return NOW, leaving whatever is queued behind R1 untouched --
+                // the data-start token of a CMD17/18 is exactly what the narrow
+                // `resp_len` below exists to protect.
+                return Ok(r1);
             }
+            // Everything else still clocks its full response window, even
+            // though R1 is already in hand.
+            //
+            // That window is not only how R1 is found: for a block write it is
+            // also the ONLY idle between R1 and the data token, because
+            // `write_data` follows `cmd()` directly with no `clock_n_rc_gap`
+            // between them. Returning early here cut that gap from 8 clocked
+            // bytes to as few as 2, which a permissive card tolerates and a
+            // strict one does not -- measured as a 21 s write stall on one
+            // bench card while another formatted fine.
+            spi.transfer_in_place(&mut response[..8]).await.map_err(|_| Error::SpiError)?;
+            return Ok(r1);
         }
 
         let resp_len = if is_cmd12 || has_trailing_bytes { 1 } else { 8 };
