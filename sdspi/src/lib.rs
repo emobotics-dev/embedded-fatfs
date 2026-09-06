@@ -905,8 +905,9 @@ where
         // these commands is recoverable.
         let has_trailing_bytes = matches!(cmd.cmd, 8 | 9 | 10 | 13 | 17 | 18 | 58);
         // Word-aligned 8-byte response. See wait_idle probe comment for the
-        // ESP32 PDMA alignment hazard. `stuff` is only one byte so DMA
-        // alignment is moot (1-byte transfers don't need word alignment).
+        // ESP32 PDMA alignment hazard. LENGTH is the disqualifier, not
+        // alignment (S17) -- an earlier version of this comment asserted the
+        // inverse, for a 1-byte `stuff` read this file no longer has.
         let mut response_word = [0xFFFFFFFFu32; 2];
         let response: &mut [u8; 8] = unsafe {
             &mut *(response_word.as_mut_ptr() as *mut [u8; 8])
@@ -941,6 +942,12 @@ where
             return Ok(r1);
         }
 
+        // The last sub-word transfer left in the driver. It cannot be widened:
+        // the narrow window is exactly what leaves a CMD17/18 data-start token
+        // queued for the caller's follow-up read. It differs from the transfers
+        // S14/S17 fixed -- symmetric `transfer_in_place` (rx len == tx len),
+        // not a write against the zero-length rx buffer that hangs -- and it is
+        // the fallback path: R1 normally arrives in the padding above.
         let resp_len = if is_cmd12 || has_trailing_bytes { 1 } else { 8 };
         spi.transfer_in_place(&mut response[..resp_len])
             .await
